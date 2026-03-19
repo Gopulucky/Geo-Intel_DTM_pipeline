@@ -1,0 +1,56 @@
+# Large dataset folders (>1GB - excluded from Git)
+Andaman_and_Nicobar_Islands/
+Andaman_and_Nicobar_Islands_1/
+Gujrat/
+Gujrat_Point_Cloud/
+Gopulucky/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+
+# Output folders (generated files - large rasters/vectors)
+outputs/
+
+# Common data file extensions (large rasters and point clouds)
+*.tif
+*.tiff
+*.las
+*.laz
+*.geotiff
+*.img
+*.dem
+*.asc
+*.xyz
+*.e57
+
+# Shapefiles and spatial data
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.sbn
+*.sbx
+
+# GeoJSON (can be large)
+*.geojson
+
+# Virtual rasters
+*.vrt
+
+# GDAL warp cache
+*.tmp
+
+# OS-specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp

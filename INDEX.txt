@@ -1,0 +1,124 @@
+ 
+  Page 1 of 4 
+ 
+Guide to Recommended Output Data Formats 
+AI/ML Hackathon – Ministry of Panchayat Raj  
+(Geospatial Intelligence Challenge) 
+(Issued by Geo-Intel Lab, IIT Tirupati Navavishkar I-Hub Foundation, with inputs from OGC) 
+1. Purpose of This Guide 
+The Geospatial Intelligence Hackathon focuses on AI/ML-driven analysis of drone imagery and point-
+cloud data to support governance-ready applications such as feature extraction, terrain modelling, and 
+drainage network design. 
+While participants are free to use any tools, platforms, or workflows, this guide provides recommended 
+output data formats to ensure that hackathon results are: 
+ Easy to review and validate 
+ Interoperable across GIS and AI/ML environments 
+ Reusable by government, academic, and startup ecosystems 
+ Aligned with widely adopted, open geospatial practices 
+This guidance does not change the problem statements, inputs, evaluation criteria, or expected 
+outcomes of the hackathon. It only addresses how final outputs are packaged and shared. 
+2. Recommended Output Formats 
+Based on the nature of the problem statements and data involved, the following formats are recommended 
+for final submissions. 
+2.1 Raster Outputs — Cloud Optimized GeoTIFF (COG) 
+Applies to: 
+ Orthophotos 
+ Digital Terrain Models (DTM) 
+ Derived raster surfaces (slope, flow accumulation, masks, probability maps, etc.) 
+ 
+ 
+ 
+---PAGE---
+ 
+  Page 2 of 4 
+ 
+ 
+Recommended format: Cloud Optimized GeoTIFF (COG) 
+Why COG: 
+ Designed for efficient handling of large raster datasets 
+ Supports fast access, visualization, and processing, especially for large raster datasets and cloud-
+based workflows 
+ Widely supported in QGIS, ArcGIS, GDAL, and AI/ML pipelines 
+ Increasingly used in government and cloud-native geospatial systems 
+Reference links: 
+ COG Community Website (tools & ecosystem to generate COG format outputs): 
+https://cogeo.org/ 
+ OGC Cloud Optimized GeoTIFF (COG) Standard: 
+https://www.ogc.org/standards/ogc-cloud-optimized-geotiff/ 
+ 
+2.2 Vector Outputs — GeoPackage (GPKG) 
+Applies to: 
+ Building footprints (including roof-type attributes) 
+ Roads 
+ Drainage networks 
+ Waterbodies 
+ Asset locations (DTs, OHTs, wells, etc.) 
+Recommended format: GeoPackage (GPKG) 
+Why GeoPackage: 
+ Single-file, portable container for vector GIS data 
+ Supports multiple layers, attributes, and CRS in one file 
+ Easier to manage and review than multi-file formats (e.g., shapefiles) 
+ Fully supported in QGIS, ArcGIS, and common spatial databases 
+Reference links: 
+---PAGE---
+ 
+  Page 3 of 4 
+ 
+ GeoPackage Community Website (tools & extensions useful for generating GeoPackage format 
+outputs): 
+https://www.geopackage.org/ 
+ OGC GeoPackage Standard: 
+https://www.ogc.org/standards/geopackage/ 
+ 
+2.3 Point-Cloud / LiDAR Outputs — LAS 
+Applies to: 
+ Drone-derived point-cloud data 
+ Classified point clouds used for DTM generation 
+ Intermediate or final 3D point-cloud outputs 
+Recommended format: LAS 
+Why LAS: 
+ Widely adopted, open format for LiDAR and point-cloud exchange 
+ Supported across GIS, surveying, and AI/ML ecosystems through widely used libraries and tools 
+ Enables consistent sharing of classified and unclassified point data 
+ Suitable for both research workflows and operational reuse 
+Reference links: 
+ LAS format overview: 
+https://laspy.readthedocs.io/en/latest/intro.html 
+ LAS Python library (laspy): 
+https://laspy.readthedocs.io/en/latest/index.html 
+ OGC LAS Standard: 
+https://www.ogc.org/standards/las/ 
+3. Application to Hackathon Problem Statements 
+Problem Statement 1 
+Feature Extraction from Drone Images (SVAMITVA) 
+ Raster inputs and derived outputs 
+→ Cloud Optimized GeoTIFF (COG) 
+---PAGE---
+ 
+  Page 4 of 4 
+ 
+ Extracted features (buildings, roads, waterbodies, assets) 
+→ GeoPackage (GPKG) 
+Problem Statement 2 
+DTM Creation from Point Clouds and Drainage Network Design 
+ Point-cloud data (If providing any processed LiDAR outputs) 
+→ LAS 
+ DTM and derived raster surfaces 
+→ Cloud Optimized GeoTIFF (COG) 
+ Drainage networks and GIS-ready design layers 
+→ GeoPackage (GPKG) 
+4. Important Clarifications for Participants 
+ Participants may use any software, libraries, or platforms of their choice 
+ This guide does not mandate tools, models, or workflows 
+ No additional scoring is tied to format selection 
+ The intent is to encourage clean, interoperable, and reusable outputs 
+ These formats are already supported by most commonly used GIS and AI/ML tools 
+5. Why This Matters 
+By following this guidance, participants help ensure that hackathon outputs: 
+ Align with real-world government and academic workflows 
+ Can be easily validated, shared, and extended beyond the event 
+ Introduce practical awareness of open, vendor-neutral geospatial formats 
+ Contribute to a more interoperable and future-ready geospatial ecosystem 
+This approach reflects IITNiF’s broader mission to foster scalable, standards-aware innovation while 
+keeping the hackathon inclusive, practical, and outcome-focused. 
+ 

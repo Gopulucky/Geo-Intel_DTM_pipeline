@@ -67,7 +67,7 @@ CONFIG = {
 
     # DTM raster
     "dtm_resolution": 2.0,                  # metres per pixel (2.0m for Colab; use 0.5-1.0 on high-RAM machines)
-    "dtm_interp":     "nearest",            # nearest = low RAM; use 'linear' on high-RAM machines
+    "dtm_interp":     "linear",             # linear creates a smooth continuous slope for hydrology routing
 
     # ML Classifier
     "rf_n_estimators": 200,
@@ -93,6 +93,17 @@ os.makedirs(CONFIG["output_dir"], exist_ok=True)
 # MODULE 1 – POINT CLOUD LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
+def ensure_metric_crs(x, y):
+    """Reproject to UTM if coordinates are in degrees."""
+    if -180 <= x.min() <= x.max() <= 180 and -90 <= y.min() <= y.max() <= 90:
+        from pyproj import Transformer
+        print(f"  [CRS] Coordinates appear to be Geographic. Reprojecting to EPSG:{CONFIG['epsg']}...")
+        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{CONFIG['epsg']}", always_xy=True)
+        # transform might return tuple, ensure numpy arrays
+        x_new, y_new = transformer.transform(x, y)
+        return np.array(x_new), np.array(y_new)
+    return x, y
+
 def load_point_cloud(las_path: str) -> pd.DataFrame:
     """
     Load a LAS/LAZ file and return a DataFrame of point attributes.
@@ -110,6 +121,9 @@ def load_point_cloud(las_path: str) -> pd.DataFrame:
         "scan_angle":      np.array(las.scan_angle_rank).astype(np.float32),
         "classification":  np.array(las.classification).astype(np.uint8),
     })
+    
+    df["x"], df["y"] = ensure_metric_crs(df["x"].values, df["y"].values)
+    
     print(f"  Loaded {len(df):,} points from {os.path.basename(las_path)}")
     return df
 
@@ -169,6 +183,8 @@ def load_ground_only(las_path: str, max_points: int = None) -> pd.DataFrame:
     z = np.concatenate(ground_z); del ground_z
     gc.collect()
 
+    x, y = ensure_metric_crs(x, y)
+
     # Subsample if too many ground points
     if len(x) > max_pts:
         print(f"  Subsampling ground points: {len(x):,} → {max_pts:,}")
@@ -211,15 +227,15 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
     rng = np.random.RandomState(CONFIG["random_state"])
 
     with laspy.open(las_path) as las_file:
+        tot_pts = las_file.header.point_count
+        keep_frac = min(1.0, subsample_cap / max(tot_pts, 1))
+        
         for chunk in las_file.chunk_iterator(chunk_size):
             n_total += len(chunk)
             cx = np.array(chunk.x).astype(np.float32)
             cy = np.array(chunk.y).astype(np.float32)
             cz = np.array(chunk.z).astype(np.float32)
 
-            # Reservoir-style subsampling: keep ~subsample_cap/total fraction
-            # Since we don't know total yet, keep a generous fraction and trim later
-            keep_frac = min(1.0, subsample_cap / max(n_total, 1))
             if keep_frac < 1.0:
                 mask = rng.random(len(cx)) < keep_frac
                 cx, cy, cz = cx[mask], cy[mask], cz[mask]
@@ -246,6 +262,8 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
         gc.collect()
 
     print(f"  [Fallback] Working with {len(x):,} subsampled points")
+
+    x, y = ensure_metric_crs(x, y)
 
     # Grid-based lowest-percentile filter (5m cells, keep bottom 10%)
     cell_size = 5.0  # metres
@@ -452,6 +470,20 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
         method=interp,
         rescale=True,
     )
+    
+    # ── MASK OUT NO-DATA (CONVEX HULL ARTIFACTS) ──
+    from scipy.spatial import cKDTree
+    print("  Applying KDTree distance mask to remove Convex Hull artifacts…")
+    tree = cKDTree(gnd[["x", "y"]].values)
+    
+    # Query distance for every pixel coordinate in the grid
+    dist, _ = tree.query(np.column_stack((gx.ravel(), gy.ravel())))
+    dist = dist.reshape(gx.shape)
+    
+    # Set maximum distance threshold (15 meters is safe for high-res drone data)
+    max_dist = max(15.0, res * 5.0)
+    dtm[dist > max_dist] = np.nan
+
     dtm = np.flipud(dtm)   # rasterio convention: row 0 = top
 
     # Save GeoTIFF
@@ -459,7 +491,8 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DTM.tif")
     with rasterio.open(
         out_path, "w",
-        driver="GTiff",
+        driver="COG",
+        compress="LZW",
         height=dtm.shape[0], width=dtm.shape[1],
         count=1, dtype="float32",
         crs=CRS.from_epsg(CONFIG["epsg"]),
@@ -515,32 +548,48 @@ def run_hydrology(dtm_path: str, village_name: str,
 
     # ── 1. Breach depressions ──────────────────────────────────────────────────
     print("  Breaching depressions to model culverts/drainpaths…")
-    wbt.breach_depressions(dem=dtm_abs, output=breached)
+    wbt.breach_depressions(dem=os.path.basename(dtm_abs), output=os.path.basename(breached), flat_increment=0.001)
 
     # ── 2. Flow direction & accumulation ─────────────────────────────────────
     print("  Computing flow direction & accumulation (D8)…")
-    wbt.d8_pointer(dem=breached, output=fdir)
-    wbt.d8_flow_accumulation(i=breached, output=facc, out_type="cells")
+    wbt.d8_pointer(dem=os.path.basename(breached), output=os.path.basename(fdir))
+    wbt.d8_flow_accumulation(i=os.path.basename(breached), output=os.path.basename(facc), out_type="cells")
     paths["FlowAccumulation"] = facc
 
     # ── 3. Stream extraction & Watersheds ────────────────────────────────────
     print("  Extracting streams and catchments…")
-    wbt.extract_streams(flow_accum=facc, output=streams_tif, threshold=threshold)
-    wbt.raster_streams_to_vector(streams=streams_tif, d8_pntr=fdir, output=streams_vec)
+    
+    # Adaptive threshold to guarantee stream extraction
+    current_thresh = threshold
+    while current_thresh >= 10:
+        wbt.extract_streams(flow_accum=os.path.basename(facc), output=os.path.basename(streams_tif), threshold=current_thresh)
+        wbt.raster_streams_to_vector(streams=os.path.basename(streams_tif), d8_pntr=os.path.basename(fdir), output=os.path.basename(streams_vec))
+        
+        if os.path.exists(streams_vec):
+            import geopandas as gpd
+            try:
+                if len(gpd.read_file(streams_vec)) > 0:
+                    break
+            except Exception:
+                pass
+        
+        print(f"  ⚠️ No streams extracted at threshold {current_thresh}. Halving and retrying...")
+        current_thresh //= 2
+
     paths["streams"] = streams_vec
     
-    wbt.subbasins(d8_pntr=fdir, streams=streams_tif, output=catchments)
+    wbt.subbasins(d8_pntr=os.path.basename(fdir), streams=os.path.basename(streams_tif), output=os.path.basename(catchments))
     paths["catchments"] = catchments
 
     # ── 4. Waterlogging hotspots (Depression + TWI) ──────────────────────────
     print("  Predicting waterlogging zones (Sink Depth & TWI)…")
     # FIX: use breached DTM (not raw DTM) so waterlogging depth aligns with the flow network
-    wbt.depth_in_sink(dem=breached, output=sink_depth, zero_background=False)
+    wbt.depth_in_sink(dem=os.path.basename(breached), output=os.path.basename(sink_depth), zero_background=False)
     paths["WaterloggingDepth"] = sink_depth
     
-    wbt.slope(dem=breached, output=slope, units="degrees")
-    wbt.d_inf_flow_accumulation(i=breached, output=sca, out_type="sca")
-    wbt.wetness_index(sca=sca, slope=slope, output=twi)
+    wbt.slope(dem=os.path.basename(breached), output=os.path.basename(slope), units="degrees")
+    wbt.d_inf_flow_accumulation(i=os.path.basename(breached), output=os.path.basename(sca), out_type="sca")
+    wbt.wetness_index(sca=os.path.basename(sca), slope=os.path.basename(slope), output=os.path.basename(twi))
     paths["TWI"] = twi
 
     # Clean up temp files if desired
@@ -558,8 +607,8 @@ def run_hydrology(dtm_path: str, village_name: str,
         
     hotspot_polys = _raster_to_polygons(hotspot_mask, sink_depth, min_area_m2=4.0)
     if hotspot_polys is not None and len(hotspot_polys) > 0:
-        hp_path = out_file("WaterloggingHotspots.geojson")
-        hotspot_polys.to_file(hp_path, driver="GeoJSON")
+        hp_path = out_file("WaterloggingHotspots.gpkg")
+        hotspot_polys.to_file(hp_path, driver="GPKG")
         paths["hotspots"] = hp_path
         print(f"  Waterlogging hotspots → {hp_path} ({len(hotspot_polys)} zones)")
 
@@ -631,6 +680,7 @@ def compute_drainage_parameters(streams_path: str,
         dtm_arr = src.read(1).astype(float)
         dtm_arr[dtm_arr == src.nodata] = np.nan
         transform = src.transform
+        dtm_crs = src.crs
 
     def _sample_z(geom):
         """Sample DTM at start and end of line."""
@@ -673,8 +723,11 @@ def compute_drainage_parameters(streams_path: str,
         (gdf["slope_m_m"] ** 0.5)
     ).clip(0.3, 4.0)
 
-    out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson")
-    gdf.to_file(out_path, driver="GeoJSON")
+    if 'dtm_crs' in locals() and dtm_crs is not None:
+        gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
+        
+    out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg")
+    gdf.to_file(out_path, driver="GPKG")
     print(f"  Drainage design parameters saved → {out_path}")
     print(gdf[["strahler_ord","slope_m_m","peak_flow_m3s",
                "channel_width_m","channel_depth_m","velocity_m_s"]].describe().round(3))
@@ -955,32 +1008,30 @@ def run_all_villages(las_dir: str = None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ── RECOMMENDED: Memory-efficient mode (for Colab / large datasets) ──────
-    # Uses existing ground labels (Class 2), skips ML, subsamples to save RAM
+    import sys
+    VILLAGES = [
+        {"name": "DEVDI_511671", "las_path": "./Gujrat_Point_Cloud/DEVDI_POINT CLOUD (511671).las", "flow_acc_threshold": 500, "epsg": 32643},
+        {"name": "KHAPRETA_510206", "las_path": "./Gujrat_Point_Cloud/KHAPRETA_510206.laz", "flow_acc_threshold": 300, "epsg": 32643},
+        {"name": "Dhal_Hoshiarpur_31235", "las_path": "./Punjab_Point_Cloud/Dhal_Hoshiarpur_31235.las", "flow_acc_threshold": 500, "epsg": 32643},
+        {"name": "DHUNDA_FATEHGARH_SAHIB_32619", "las_path": "./Punjab_Point_Cloud/DHUNDA_FATEHGARH SAHIB_32619.laz", "flow_acc_threshold": 500, "epsg": 32643},
+        {"name": "67169_5NKR_CHAKHIRASINGH", "las_path": "./Rajasthan_Point_Cloud/67169_5NKR_CHAKHIRASINGH.las", "flow_acc_threshold": 500, "epsg": 32643},
+        {"name": "64334_2H_REFLIGHT", "las_path": "./Rajasthan_Point_Cloud/64334_2H (REFLIGHT)_POINT CLOUD.LAS", "flow_acc_threshold": 500, "epsg": 32643},
+        {"name": "PIRAYANKUPPAM", "las_path": "./Tamil Nadu_Point_Cloud/PIRAYANKUPPAM.las", "flow_acc_threshold": 500, "epsg": 32644},
+        {"name": "THANDALAM", "las_path": "./Tamil Nadu_Point_Cloud/THANDALAM.las", "flow_acc_threshold": 500, "epsg": 32644},
+        {"name": "Gandhinagar_Diglipur", "las_path": "./Andaman_and_Nicobar_Islands_1/Gandhinagar_Diglipur_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
+        {"name": "Kadamtala_Rangat", "las_path": "./Andaman and Nicobar Islands 2/Kadamtala_Rangat_A&N_02022022_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
+    ]
 
-    # ── Gujarat Village 1: DEVDI ──────────────────────────────────────────────
-    # flow_acc_threshold: 500 cells → ~2000 m² contributing area at 2m resolution
-    CONFIG["_village_flow_threshold"] = 500
-    result_devdi = run_pipeline_memory_efficient(
-        "./Gujrat_Point_Cloud/DEVDI_POINT CLOUD (511671).las",
-        "DEVDI_511671"
-    )
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        VILLAGES = [v for v in VILLAGES if v["name"] == target]
 
-    # ── Gujarat Village 2: KHAPRETA (Karpeta) ─────────────────────────────────
-    # Uses a lower threshold (300) because KHAPRETA may have a smaller or
-    # more densely-sampled area — increase if too many noisy stream segments appear,
-    # decrease if no streams are extracted.
-    CONFIG["_village_flow_threshold"] = 300
-    result_khapreta = run_pipeline_memory_efficient(
-        "./Gujrat_Point_Cloud/KHAPRETA_510206.laz",
-        "KHAPRETA_510206"
-    )
-
-    # ── OPTION B: Full ML pipeline (needs more RAM) ──────────────────────────
-    # result = run_pipeline_for_village(
-    #     "./Gujrat_Point_Cloud/DEVDI_POINT CLOUD (511671).las",
-    #     "DEVDI_511671", train_mode=True
-    # )
-
-    # ── OPTION C: DTM accuracy check (if GCP CSV available) ──────────────────
-    # evaluate_dtm_accuracy("./outputs/DEVDI_511671_DTM.tif", "./data/GCPs.csv")
+    for v in VILLAGES:
+        if os.path.exists(v["las_path"]):
+            CONFIG["output_dir"] = os.path.join(".", "outputs", v["name"])
+            os.makedirs(CONFIG["output_dir"], exist_ok=True)
+            CONFIG["_village_flow_threshold"] = v["flow_acc_threshold"]
+            CONFIG["epsg"] = v["epsg"]
+            run_pipeline_memory_efficient(v["las_path"], v["name"])
+        else:
+            print(f"Skipping {v['name']} - LAS file not found at {v['las_path']}")

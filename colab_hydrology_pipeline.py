@@ -10,10 +10,11 @@ import numpy as np
 def setup_whitebox(working_dir):
     """Initializes WhiteboxTools and sets the working directory."""
     wbt = whitebox.WhiteboxTools()
-    wbt.set_working_dir(working_dir)
+    abs_work_dir = os.path.abspath(working_dir)
+    wbt.set_working_dir(abs_work_dir)
     # Set verbose to False to avoid crashing Colab output with too much text
     wbt.set_verbose_mode(False) 
-    print(f"WhiteboxTools initialized. Working directory: {working_dir}")
+    print(f"WhiteboxTools initialized. Working directory: {abs_work_dir}")
     return wbt
 
 def verify_metric_crs(dtm_path):
@@ -22,13 +23,13 @@ def verify_metric_crs(dtm_path):
         crs = src.crs
         if crs is None:
             print("⚠️ WARNING: No CRS found in DTM! Spatial calculations will fail.")
-            return False
+            return None
         if crs.is_geographic:
             print(f"🚨 CRITICAL ERROR: DTM is in Geographic CRS ({crs}). Must be projected (Metric)!")
-            return False
+            return None
         else:
             print(f"✅ Metric CRS confirmed: {crs}")
-            return True
+            return crs
 
 def step1_hydrological_breaching(wbt, dtm_file, breached_file):
     """
@@ -65,29 +66,45 @@ def step2_flow_modeling(wbt, breached_file, fdir_file, facc_file):
     )
     print(f"✅ Flow Accumulation saved to: {facc_file}")
 
-def step3_stream_extraction_and_smoothing(wbt, facc_file, fdir_file, raster_streams_file, vector_streams_file, threshold=500, simplify_tolerance=1.5, min_dangle_length=15.0):
+def step3_stream_extraction_and_smoothing(wbt, facc_file, fdir_file, raster_streams_file, vector_streams_file, threshold=500, simplify_tolerance=1.5, min_dangle_length=15.0, dtm_crs=None):
     """
     Extract streams based on a threshold, convert to vector, and remove jagged edges/dangles.
     """
-    print(f"⏳ Extracting streams (Threshold > {threshold} cells)...")
-    wbt.extract_streams(
-        flow_accum=facc_file,
-        output=raster_streams_file,
-        threshold=threshold
-    )
+    current_thresh = threshold
+    vector_path = os.path.join(wbt.work_dir, vector_streams_file)
     
-    print("⏳ Converting raster streams to vector...")
-    wbt.raster_streams_to_vector(
-        streams=raster_streams_file,
-        d8_pntr=fdir_file,
-        output=vector_streams_file
-    )
+    while current_thresh >= 10:
+        print(f"⏳ Extracting streams (Threshold > {current_thresh} cells)...")
+        wbt.extract_streams(
+            flow_accum=facc_file,
+            output=raster_streams_file,
+            threshold=current_thresh
+        )
+        
+        print("⏳ Converting raster streams to vector...")
+        wbt.raster_streams_to_vector(
+            streams=raster_streams_file,
+            d8_pntr=fdir_file,
+            output=vector_streams_file
+        )
+        
+        if os.path.exists(vector_path):
+            try:
+                if len(gpd.read_file(vector_path)) > 0:
+                    break
+            except Exception:
+                pass
+                
+        print(f"⚠️ No streams extracted at threshold {current_thresh}. Halving and retrying...")
+        current_thresh //= 2
     
     # --- Vector Smoothing and Cleanup (Geopandas) ---
     print("⏳ Smoothing streams and removing dangles...")
     
-    # WhiteboxTools outputs to its working directory, so we must point Geopandas there
-    vector_path = os.path.join(wbt.work_dir, vector_streams_file)
+    if not os.path.exists(vector_path):
+        print(f"⚠️ Vector streams file not created: {vector_path}. No streams extracted or WBT failed.")
+        return vector_streams_file
+        
     gdf = gpd.read_file(vector_path)
     
     if len(gdf) > 0:
@@ -101,10 +118,13 @@ def step3_stream_extraction_and_smoothing(wbt, facc_file, fdir_file, raster_stre
         # Keep lines that are longer than our dangle threshold or are part of major streams
         gdf = gdf[gdf["length_m"] > min_dangle_length].copy()
         
+        if dtm_crs is not None:
+            gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
+            
         # Save cleaned streams
-        clean_streams_file = vector_streams_file.replace(".shp", "_Clean.geojson")
+        clean_streams_file = vector_streams_file.replace(".shp", "_Clean.gpkg")
         clean_path = os.path.join(wbt.work_dir, clean_streams_file)
-        gdf.to_file(clean_path, driver="GeoJSON")
+        gdf.to_file(clean_path, driver="GPKG")
         print(f"✅ Cleaned and smoothed stream network saved to: {clean_streams_file}")
         return clean_streams_file
     else:
@@ -227,12 +247,12 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     # ── Auto-generate output file names from the DTM prefix ──────────────────
     pfx            = dtm_filename.replace("_DTM.tif", "")
     BREACHED_DTM   = f"{pfx}_BreachedDTM.tif"
-    FDIR           = f"{pfx}_FDir.tif"
-    FACC           = f"{pfx}_FAcc.tif"
+    FDIR           = f"{pfx}_FlowDirection.tif"
+    FACC           = f"{pfx}_FlowAccumulation.tif"
     RASTER_STREAMS = f"{pfx}_RasterStreams.tif"
-    VECTOR_STREAMS = f"{pfx}_VectorStreams.shp"
+    VECTOR_STREAMS = f"{pfx}_Streams.shp"
     SLOPE          = f"{pfx}_Slope.tif"
-    TWI            = f"{pfx}_TWI_Waterlogging.tif"
+    TWI            = f"{pfx}_TWI.tif"
     WATER_DEPTH    = f"{pfx}_WaterDepth.tif"
     WATERSHEDS     = f"{pfx}_Catchments.tif"
 
@@ -243,7 +263,8 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
 
     wbt = setup_whitebox(work_dir)
 
-    if not verify_metric_crs(dtm_path):
+    dtm_crs = verify_metric_crs(dtm_path)
+    if dtm_crs is None:
         print(f"🚨 CRS check failed for {dtm_filename} – aborting this village.")
         return
 
@@ -251,7 +272,7 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     step2_flow_modeling(wbt, BREACHED_DTM, FDIR, FACC)
     step3_stream_extraction_and_smoothing(
         wbt, FACC, FDIR, RASTER_STREAMS, VECTOR_STREAMS,
-        threshold=stream_threshold
+        threshold=stream_threshold, dtm_crs=dtm_crs
     )
     step4_waterlogging_hotspots(wbt, dtm_filename, BREACHED_DTM, TWI, SLOPE, WATER_DEPTH)
     step5_pour_points_and_catchments(wbt, FDIR, RASTER_STREAMS, WATERSHEDS)
@@ -269,24 +290,35 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
 
 
 if __name__ == "__main__":
-    # ── Working directory ─────────────────────────────────────────────────────
-    # In Google Colab use: '/content/drive/MyDrive/model/outputs'
+    import sys
     WORK_DIR = os.path.join(os.getcwd(), 'outputs')
-    os.makedirs(WORK_DIR, exist_ok=True)
 
-    # ── Village 1 : DEVDI ─────────────────────────────────────────────────────
-    # threshold=1000 → only well-defined channels (good for DEVDI data density)
-    run_village_pipeline(
-        work_dir         = WORK_DIR,
-        dtm_filename     = "DEVDI_511671_DTM.tif",
-        stream_threshold = 1000,
-    )
+    VILLAGES = [
+        {"name": "DEVDI_511671", "stream_threshold": 500},
+        {"name": "KHAPRETA_510206", "stream_threshold": 300},
+        {"name": "Dhal_Hoshiarpur_31235", "stream_threshold": 500},
+        {"name": "DHUNDA_FATEHGARH_SAHIB_32619", "stream_threshold": 500},
+        {"name": "67169_5NKR_CHAKHIRASINGH", "stream_threshold": 500},
+        {"name": "64334_2H_REFLIGHT", "stream_threshold": 500},
+        {"name": "PIRAYANKUPPAM", "stream_threshold": 500},
+        {"name": "THANDALAM", "stream_threshold": 500},
+        {"name": "Gandhinagar_Diglipur", "stream_threshold": 500},
+        {"name": "Kadamtala_Rangat", "stream_threshold": 500},
+    ]
 
-    # ── Village 2 : KHAPRETA (Karpeta) ───────────────────────────────────────
-    # threshold=300  → lower so more streams are extracted from KHAPRETA's DTM
-    # Tune up (e.g. 500–700) if too many noisy branches appear in the output.
-    run_village_pipeline(
-        work_dir         = WORK_DIR,
-        dtm_filename     = "KHAPRETA_510206_DTM.tif",
-        stream_threshold = 300,
-    )
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        VILLAGES = [v for v in VILLAGES if v["name"] == target]
+
+    for v in VILLAGES:
+        village_work_dir = os.path.join(WORK_DIR, v["name"])
+        os.makedirs(village_work_dir, exist_ok=True)
+        dtm_filename = f"{v['name']}_DTM.tif"
+        if os.path.exists(os.path.join(village_work_dir, dtm_filename)):
+            run_village_pipeline(
+                work_dir         = village_work_dir,
+                dtm_filename     = dtm_filename,
+                stream_threshold = v["stream_threshold"],
+            )
+        else:
+            print(f"Skipping {v['name']} - DTM file not found at {os.path.join(village_work_dir, dtm_filename)}")

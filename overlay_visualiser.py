@@ -281,16 +281,18 @@ def run_overlay_visualisation(
     # ── 4. Auto-detect optional file paths ────────────────────────────────────
     base_dir = os.path.dirname(dtm_path)
     if streams_path is None:
-        for sfx in ("_VectorStreams_Clean.geojson",
+        for sfx in ("_DrainageDesign.gpkg", "_Clean.gpkg", "_VectorStreams_Clean.geojson",
                     "_Streams.shp", "_Streams.geojson"):
             p = os.path.join(base_dir, village_name + sfx)
             if os.path.exists(p):
                 streams_path = p
                 break
     if hotspot_path is None:
-        p = os.path.join(base_dir, f"{village_name}_WaterloggingHotspots.geojson")
-        if os.path.exists(p):
-            hotspot_path = p
+        for ext in (".gpkg", ".geojson"):
+            p = os.path.join(base_dir, f"{village_name}_WaterloggingHotspots{ext}")
+            if os.path.exists(p):
+                hotspot_path = p
+                break
 
     flow_path = os.path.join(base_dir, f"{village_name}_FAcc.tif")
     if not os.path.exists(flow_path):
@@ -661,25 +663,40 @@ def run_overlay_visualisation(
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
+    import sys
     OUTPUT_DIR = "/content/outputs"     # ← change to your path
+    if os.path.exists("./outputs"): OUTPUT_DIR = "./outputs" # Fallback for local
 
-    # ── Village 1: DEVDI ──────────────────────────────────────────────────────
-    run_overlay_visualisation(
-        village_name = "DEVDI_511671",
-        dtm_path     = f"{OUTPUT_DIR}/DEVDI_511671_DTM.tif",
-        ortho_path   = None,            # e.g. "/content/drive/MyDrive/model/DEVDI_ortho.tif"
-        output_dir   = OUTPUT_DIR,
-        epsg         = 32643,
-        export_html  = True,
-    )
+    VILLAGES = [
+        {"name": "DEVDI_511671", "epsg": 32643},
+        {"name": "KHAPRETA_510206", "epsg": 32643},
+        {"name": "Dhal_Hoshiarpur_31235", "epsg": 32643},
+        {"name": "DHUNDA_FATEHGARH_SAHIB_32619", "epsg": 32643},
+        {"name": "67169_5NKR_CHAKHIRASINGH", "epsg": 32643},
+        {"name": "64334_2H_REFLIGHT", "epsg": 32643},
+        {"name": "PIRAYANKUPPAM", "epsg": 32644},
+        {"name": "THANDALAM", "epsg": 32644},
+        {"name": "Gandhinagar_Diglipur", "epsg": 32646},
+        {"name": "Kadamtala_Rangat", "epsg": 32646},
+    ]
 
-    # ── Village 2: KHAPRETA ───────────────────────────────────────────────────
-    run_overlay_visualisation(
-        village_name = "KHAPRETA_510206",
-        dtm_path     = f"{OUTPUT_DIR}/KHAPRETA_510206_DTM.tif",
-        ortho_path   = None,            # e.g. "/content/drive/MyDrive/model/KHAPRETA_ortho.tif"
-        output_dir   = OUTPUT_DIR,
-        epsg         = 32643,
-        export_html  = True,
-    )
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        VILLAGES = [v for v in VILLAGES if v["name"] == target]
+
+    for v in VILLAGES:
+        village_output_dir = f"{OUTPUT_DIR}/{v['name']}"
+        os.makedirs(village_output_dir, exist_ok=True)
+        dtm_path = f"{village_output_dir}/{v['name']}_DTM.tif"
+        
+        if os.path.exists(dtm_path):
+            run_overlay_visualisation(
+                village_name = v["name"],
+                dtm_path     = dtm_path,
+                ortho_path   = None,            # e.g. "/content/drive/MyDrive/model/{v['name']}_ortho.tif"
+                output_dir   = village_output_dir,
+                epsg         = v["epsg"],
+                export_html  = True,
+            )
+        else:
+            print(f"Skipping {v['name']} - DTM file not found at {dtm_path}")

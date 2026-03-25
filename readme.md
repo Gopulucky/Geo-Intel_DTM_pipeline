@@ -7,8 +7,8 @@ This is the **unified guide** to running the complete geospatial pipeline for al
 *   **Point-Cloud Outputs:** LAS/LAZ files (as inputs from drone surveys).
 
 The pipeline consists of four core Python files:
-1. **DTM & Drainage Network** (`dtm_drainage_pipeline.py`) - Extracts bare earth from LiDAR and delineates initial streams/drainage.
-2. **Hydrological Analysis** (`colab_hydrology_pipeline.py`) - Calculates flow direction, accumulation, and waterlogging hotspots.
+1. **DTM & Drainage Network** (`dtm_drainage_pipeline.py`) - Main end-to-end processing script. Extracts bare earth from LiDAR via ML, delineates streams/drainage, and calculates flow accumulation and parameters. Use this for the full pipeline.
+2. **Hydrological Analysis** (`colab_hydrology_pipeline.py`) - Standalone secondary script focusing purely on hydrological analysis. Useful for rapid interactive tuning of flow accumulation thresholds in Colab without running the full ML classification.
 3. **Overlay Visualization** (`overlay_visualiser.py`) - Generates rich final overlays and interactive folium maps.
 4. **Interactive Launcher** (`run_pipeline.py`) - An easy-to-use menu that ties them all together.
 
@@ -45,7 +45,7 @@ drive.mount('/content/drive')
 
 # Install all required libraries
 !pip install laspy[lazrs] pysheds geopandas rasterio scipy \
-             scikit-learn matplotlib numpy pandas \
+             scikit-learn matplotlib numpy pandas pyproj \
              shapely tqdm joblib whitebox folium geopandas -q
 ```
 *(Run this cell and wait 1–2 minutes for the installation to complete.)*

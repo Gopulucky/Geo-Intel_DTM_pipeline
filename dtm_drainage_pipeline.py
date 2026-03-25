@@ -17,7 +17,7 @@ Pipeline:
 =============================================================================
 USAGE (Google Colab):
   !pip install laspy[lazrs] pysheds geopandas rasterio scipy scikit-learn
-      matplotlib numpy pandas
+      matplotlib numpy pandas pyproj
   Then run all cells.
 =============================================================================
 """
@@ -28,7 +28,7 @@ USAGE (Google Colab):
 """
 # Run this in a Colab cell:
 !pip install laspy[lazrs] pysheds geopandas rasterio scipy scikit-learn \
-             matplotlib numpy pandas shapely tqdm joblib -q
+             matplotlib numpy pandas shapely tqdm joblib pyproj -q
 """
 
 # ─────────────────────────────────────────────
@@ -82,9 +82,28 @@ CONFIG = {
     # Memory management
     "max_ground_points": 500_000,           # max ground points for DTM interpolation (subsample if larger)
 
-    # CRS – UTM Zone 43N for Gujarat
-    "epsg": 32643,
+    # CRS will be dynamically resolved per village
+    "epsg": None,
 }
+
+VILLAGE_EPSG = {
+    "Gujrat": 32643,
+    "Rajasthan": 32643,
+    "Punjab": 32643,
+    "Tamil_Nadu": 32644,
+    "Andaman": 32646,
+}
+
+def get_epsg_for_village(village_name: str) -> int:
+    """Determine EPSG based on village name or fallback to Gujarat."""
+    name_lower = village_name.lower()
+    if "pirayankuppam" in name_lower or "thandalam" in name_lower:
+        return VILLAGE_EPSG["Tamil_Nadu"]
+    elif "gandhinagar" in name_lower or "kadamtala" in name_lower or "andaman" in name_lower:
+        return VILLAGE_EPSG["Andaman"]
+    # Gujarat, Rajasthan, Punjab are all 32643
+    return VILLAGE_EPSG["Gujrat"]
+
 
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
@@ -95,10 +114,11 @@ os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
 def ensure_metric_crs(x, y):
     """Reproject to UTM if coordinates are in degrees."""
+    epsg = CONFIG.get("epsg") or 32643
     if -180 <= x.min() <= x.max() <= 180 and -90 <= y.min() <= y.max() <= 90:
         from pyproj import Transformer
-        print(f"  [CRS] Coordinates appear to be Geographic. Reprojecting to EPSG:{CONFIG['epsg']}...")
-        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{CONFIG['epsg']}", always_xy=True)
+        print(f"  [CRS] Coordinates appear to be Geographic. Reprojecting to EPSG:{epsg}...")
+        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
         # transform might return tuple, ensure numpy arrays
         x_new, y_new = transformer.transform(x, y)
         return np.array(x_new), np.array(y_new)
@@ -118,7 +138,7 @@ def load_point_cloud(las_path: str) -> pd.DataFrame:
         "intensity":       np.array(las.intensity).astype(np.float32),
         "return_number":   np.array(las.return_number).astype(np.uint8),
         "num_returns":     np.array(las.number_of_returns).astype(np.uint8),
-        "scan_angle":      np.array(las.scan_angle_rank).astype(np.float32),
+        "scan_angle":      np.array(getattr(las, 'scan_angle_rank', getattr(las, 'scan_angle', np.zeros(len(las.x))))).astype(np.float32),
         "classification":  np.array(las.classification).astype(np.uint8),
     })
     
@@ -450,6 +470,10 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     res = resolution or CONFIG["dtm_resolution"]
     interp = method or CONFIG["dtm_interp"]
 
+    # Ensure EPSG is set for this village
+    if CONFIG.get("epsg") is None:
+        CONFIG["epsg"] = get_epsg_for_village(village_name)
+
     gnd = df[df["pred_ground"] == 1][["x", "y", "z"]].copy()
     if len(gnd) < 100:
         raise ValueError("Too few ground points to generate DTM!")
@@ -596,6 +620,23 @@ def run_hydrology(dtm_path: str, village_name: str,
     for tmp in [sca, slope, streams_tif]:
         if os.path.exists(tmp): os.remove(tmp)
 
+    # Convert all derived rasters to COG
+    def _convert_to_cog(path):
+        if not os.path.exists(path): return
+        with rasterio.open(path) as src:
+            prof = src.profile
+            prof.update(driver="COG", compress="LZW", tiled=True)
+            arr = src.read()
+            # If no CRS exists, use the one from DTM
+            if prof.get('crs') is None and CONFIG.get('epsg'):
+                prof.update(crs=CRS.from_epsg(CONFIG['epsg']))
+        with rasterio.open(path, "w", **prof) as dst:
+            dst.write(arr)
+            
+    print("  Converting derived rasters to COG format…")
+    for r in [breached, fdir, facc, sink_depth, twi, catchments]:
+        _convert_to_cog(r)
+
     # Build Hotspots Polygons simply by thresholding depth_in_sink
     with rasterio.open(sink_depth) as src:
         depth_arr = src.read(1).astype(float)
@@ -707,9 +748,30 @@ def compute_drainage_parameters(streams_path: str,
     # Q = C * i * A  (simplified; C=0.6 for rural, i=50mm/hr design rain)
     C_runoff   = 0.6
     i_mm_hr    = 50.0
-    i_m_s      = i_mm_hr / (1000.0 * 3600.0)
-    # Catchment area proxy: assume 500 m² per contributing stream metre
-    gdf["catchment_area_m2"] = gdf["length_m"] * 500.0
+    # Catchment area mapping from Flow Accumulation raster instead of raw formula
+    facc_path = os.path.join(CONFIG["output_dir"], f"{village_name}_FlowAccumulation.tif")
+    if os.path.exists(facc_path):
+        with rasterio.open(facc_path) as src:
+            facc_arr = src.read(1).astype(float)
+            facc_transform = src.transform
+            pixel_area_m2 = abs(facc_transform.a * facc_transform.e)
+            
+        def _sample_max_facc(geom):
+            coords = list(geom.coords)
+            vals = []
+            for xy in coords:
+                r, c = rasterio.transform.rowcol(facc_transform, xy[0], xy[1])
+                r = max(0, min(r, facc_arr.shape[0]-1))
+                c = max(0, min(c, facc_arr.shape[1]-1))
+                vals.append(facc_arr[r, c])
+            return max(vals) if vals else 0
+            
+        gdf["max_flow_acc_cells"] = gdf.geometry.apply(_sample_max_facc)
+        gdf["catchment_area_m2"] = gdf["max_flow_acc_cells"] * pixel_area_m2
+    else:
+        # Fallback if raster is somehow missing
+        gdf["catchment_area_m2"] = gdf["length_m"] * 500.0
+        
     gdf["peak_flow_m3s"]     = C_runoff * i_m_s * gdf["catchment_area_m2"]
 
     # Manning's equation: Q = (1/n) * A * R^(2/3) * S^(1/2)
@@ -767,7 +829,7 @@ def visualise_results(dtm_path: str, streams_path: str,
     ax.set_xlabel("Easting (m)"); ax.set_ylabel("Northing (m)")
 
     # ── Panel 2: Flow Accumulation ────────────────────────────────────────────
-    acc_path = dtm_path.replace("_DTM.tif", "_FlowAccumulation.tif")
+    acc_path = os.path.join(CONFIG["output_dir"], f"{village_name}_FlowAccumulation.tif")
     ax = axes[0, 1]
     if os.path.exists(acc_path):
         with rasterio.open(acc_path) as src:
@@ -780,7 +842,7 @@ def visualise_results(dtm_path: str, streams_path: str,
     # ── Panel 3: Waterlogging Hotspots ────────────────────────────────────────
     ax = axes[1, 0]
     ax.imshow(dtm, cmap="terrain", extent=extent, origin="upper", alpha=0.6)
-    hs_path = dtm_path.replace("_DTM.tif", "_WaterloggingDepth.tif")
+    hs_path = os.path.join(CONFIG["output_dir"], f"{village_name}_WaterDepth.tif")
     if os.path.exists(hs_path):
         with rasterio.open(hs_path) as src:
             hs = src.read(1).astype(float)
@@ -909,7 +971,7 @@ def run_pipeline_for_village(las_path: str, village_name: str,
         "dtm":      dtm_path,
         "streams":  streams_path,
         "hotspots": hydro_paths.get("hotspots", ""),
-        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson"),
+        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg"),
         "model":    CONFIG["model_path"],
     }
 
@@ -964,7 +1026,7 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
         "dtm":      dtm_path,
         "streams":  streams_path,
         "hotspots": hydro_paths.get("hotspots", ""),
-        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson"),
+        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg"),
     }
 
 
@@ -1018,8 +1080,8 @@ if __name__ == "__main__":
         {"name": "64334_2H_REFLIGHT", "las_path": "./Rajasthan_Point_Cloud/64334_2H (REFLIGHT)_POINT CLOUD.LAS", "flow_acc_threshold": 500, "epsg": 32643},
         {"name": "PIRAYANKUPPAM", "las_path": "./Tamil Nadu_Point_Cloud/PIRAYANKUPPAM.las", "flow_acc_threshold": 500, "epsg": 32644},
         {"name": "THANDALAM", "las_path": "./Tamil Nadu_Point_Cloud/THANDALAM.las", "flow_acc_threshold": 500, "epsg": 32644},
-        {"name": "Gandhinagar_Diglipur", "las_path": "./Andaman_and_Nicobar_Islands_1/Gandhinagar_Diglipur_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
-        {"name": "Kadamtala_Rangat", "las_path": "./Andaman and Nicobar Islands 2/Kadamtala_Rangat_A&N_02022022_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
+        {"name": "Gandhinagar_Diglipur", "las_path": "./Andaman_and_Nicobar_Islands_1/Gandhinagar_Diglipur_group1_densified_point_cloud.laz", "flow_acc_threshold": 200, "epsg": 32646},
+        {"name": "Kadamtala_Rangat", "las_path": "./Andaman and Nicobar Islands 2/Kadamtala_Rangat_A&N_02022022_group1_densified_point_cloud.laz", "flow_acc_threshold": 200, "epsg": 32646},
     ]
 
     if len(sys.argv) > 1:

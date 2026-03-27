@@ -70,7 +70,7 @@ ACCENT_ORANGE = "#ff9800"
 LAYER_DEFS = [
     ("_DTM.tif",                   "Elevation (DTM)",          "terrain",    False, "m",    0.85),
     ("_FlowAccumulation.tif",      "Flow Accumulation (log)",  "Blues",      True,  "cells",0.70),
-    ("_WaterDepth.tif",            "Sink Depth / Waterlogging","PuBu",       False, "m",    0.75),
+    ("_WaterloggingHotspots.tif",  "Sink Depth / Waterlogging","PuBu",       False, "m",    0.75),
     ("_TWI_Waterlogging.tif",      "Topographic Wetness Index","RdYlGn_r",  False, "TWI",  0.75),
 ]
 
@@ -297,7 +297,9 @@ def run_overlay_visualisation(
     flow_path = os.path.join(base_dir, f"{village_name}_FAcc.tif")
     if not os.path.exists(flow_path):
         flow_path = os.path.join(base_dir, f"{village_name}_FlowAccumulation.tif")
-    wl_path = os.path.join(base_dir, f"{village_name}_WaterDepth.tif")
+    wl_path = os.path.join(base_dir, f"{village_name}_WaterloggingHotspots.tif")
+    if not os.path.exists(wl_path):
+        wl_path = os.path.join(base_dir, f"{village_name}_WaterDepth.tif")
     twi_path = os.path.join(base_dir, f"{village_name}_TWI_Waterlogging.tif")
 
     # ── 5. Load optional rasters ──────────────────────────────────────────────

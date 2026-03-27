@@ -435,6 +435,38 @@ def classify_points(df: pd.DataFrame, clf: RandomForestClassifier) -> pd.DataFra
 # MODULE 4 – DTM GENERATION (IDW / Linear Interpolation)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def save_ground_points(df: pd.DataFrame, village_name: str) -> str:
+    """Save classified ground points to a LAS file in the village output directory."""
+    if "pred_ground" in df.columns:
+        gnd_df = df[df["pred_ground"] == 1]
+    elif "classification" in df.columns:
+        gnd_df = df[df["classification"] == 2]
+    else:
+        gnd_df = df
+
+    if len(gnd_df) == 0:
+        print(f"  No ground points found to save for {village_name}.")
+        return ""
+
+    out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_GroundPoints.las")
+    print(f"  Saving {len(gnd_df):,} ground points to LAS...")
+    
+    header = laspy.LasHeader(point_format=2, version="1.2")
+    las = laspy.LasData(header)
+    
+    las.x = gnd_df["x"].values
+    las.y = gnd_df["y"].values
+    las.z = gnd_df["z"].values
+    
+    if "intensity" in gnd_df.columns:
+        las.intensity = gnd_df["intensity"].values.astype(np.uint16)
+        
+    las.classification = np.full(len(gnd_df), 2, dtype=np.uint8)
+    las.write(out_path)
+    print(f"  Ground points saved → {out_path}")
+    return out_path
+
+
 def generate_dtm(df: pd.DataFrame, village_name: str,
                  resolution: float = None,
                  method: str = None) -> tuple:
@@ -482,7 +514,10 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     
     # Set maximum distance threshold (15 meters is safe for high-res drone data)
     max_dist = max(15.0, res * 5.0)
-    dtm[dist > max_dist] = np.nan
+    dtm[dist > max_dist] = -9999.0
+    
+    # Replace any griddata-generated NaNs (outside convex hull) with exactly -9999.0
+    dtm = np.nan_to_num(dtm, nan=-9999.0)
 
     dtm = np.flipud(dtm)   # rasterio convention: row 0 = top
 
@@ -497,7 +532,7 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
         count=1, dtype="float32",
         crs=CRS.from_epsg(CONFIG["epsg"]),
         transform=transform,
-        nodata=np.nan,
+        nodata=-9999.0,
     ) as dst:
         dst.write(dtm.astype(np.float32), 1)
 
@@ -508,6 +543,31 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE 5 – HYDROLOGICAL ANALYSIS (pysheds)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def fix_raster_crs(target_tif, ref_tif):
+    """Ensure WBT outputs retain the CRS and GeoTransform of the input DTM."""
+    import rasterio
+    import os
+    import shutil
+    if not os.path.exists(target_tif): return
+    with rasterio.open(ref_tif) as src:
+        crs = src.crs
+        transform = src.transform
+    
+    with rasterio.open(target_tif) as src:
+        if src.crs == crs and src.transform == transform:
+            return
+        kwargs = src.meta.copy()
+        kwargs.update({
+            'crs': crs,
+            'transform': transform
+        })
+        data = src.read()
+    
+    tmp_tif = target_tif + ".tmp.tif"
+    with rasterio.open(tmp_tif, 'w', **kwargs) as dst:
+        dst.write(data)
+    shutil.move(tmp_tif, target_tif)
 
 def run_hydrology(dtm_path: str, village_name: str,
                   flow_threshold: int = None) -> dict:
@@ -538,9 +598,9 @@ def run_hydrology(dtm_path: str, village_name: str,
     breached = out_file("BreachedDTM.tif")
     fdir = out_file("FlowDirection.tif")
     facc = out_file("FlowAccumulation.tif")
-    streams_tif = out_file("RasterStreams.tif")
+    streams_tif = out_file("DrainageNetwork.tif")
     streams_vec = out_file("Streams.shp")
-    sink_depth = out_file("WaterDepth.tif")
+    sink_depth = out_file("WaterloggingHotspots.tif")
     twi = out_file("TWI.tif")
     slope = out_file("Slope.tif")
     sca = out_file("SCA.tif")
@@ -593,7 +653,7 @@ def run_hydrology(dtm_path: str, village_name: str,
     paths["TWI"] = twi
 
     # Clean up temp files if desired
-    for tmp in [sca, slope, streams_tif]:
+    for tmp in [sca, slope]:
         if os.path.exists(tmp): os.remove(tmp)
 
     # Build Hotspots Polygons simply by thresholding depth_in_sink
@@ -611,6 +671,10 @@ def run_hydrology(dtm_path: str, village_name: str,
         hotspot_polys.to_file(hp_path, driver="GPKG")
         paths["hotspots"] = hp_path
         print(f"  Waterlogging hotspots → {hp_path} ({len(hotspot_polys)} zones)")
+
+    print("  Fixing projection metadata for GeoTIFFs...")
+    for out_tif in [breached, fdir, facc, streams_tif, sink_depth, twi, catchments]:
+        fix_raster_crs(out_tif, dtm_abs)
 
     return paths
 
@@ -635,7 +699,15 @@ def _raster_to_polygons(mask: np.ndarray, reference_tif: str,
 
     if not geoms:
         return None
-    return gpd.GeoDataFrame(geometry=geoms, crs=crs)
+        
+    gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
+    gdf["id"] = range(1, len(gdf) + 1)
+    gdf["type"] = "Waterlogging Hotspot"
+    
+    # Safely compute area in projected CRS
+    gdf["area_m2"] = gdf.geometry.area
+    
+    return gdf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,6 +716,7 @@ def _raster_to_polygons(mask: np.ndarray, reference_tif: str,
 
 def compute_drainage_parameters(streams_path: str,
                                  dtm_path: str,
+                                 facc_path: str,
                                  village_name: str) -> gpd.GeoDataFrame:
     """
     Augment the stream network with engineering design parameters:
@@ -666,6 +739,10 @@ def compute_drainage_parameters(streams_path: str,
     if len(gdf) == 0:
         print("  Warning: Stream network is empty.")
         return gdf
+
+    # ── Vector Design Intent Attributes ──────────────────────────────────────
+    gdf["id"] = range(1, len(gdf) + 1)
+    gdf["type"] = "Natural Drain"
 
     # ── Strahler ordering (simplified: by geometry length) ───────────────────
     gdf["length_m"]     = gdf.geometry.length
@@ -708,8 +785,42 @@ def compute_drainage_parameters(streams_path: str,
     C_runoff   = 0.6
     i_mm_hr    = 50.0
     i_m_s      = i_mm_hr / (1000.0 * 3600.0)
-    # Catchment area proxy: assume 500 m² per contributing stream metre
-    gdf["catchment_area_m2"] = gdf["length_m"] * 500.0
+
+    # ── Catchment area from Flow Accumulation ────────────────────────────────
+    res = 2.0  # fallback resolution
+    try:
+        if not os.path.exists(facc_path):
+            raise FileNotFoundError("Flow Accumulation raster not found.")
+            
+        with rasterio.open(facc_path) as src:
+            facc_arr = src.read(1).astype(float)
+            if src.nodata is not None:
+                facc_arr[facc_arr == src.nodata] = 0.0
+            facc_transform = src.transform
+            res = src.res[0]
+            
+        def _sample_facc(geom):
+            coords = list(geom.coords)
+            # Sample at the downstream end
+            row, col = rasterio.transform.rowcol(facc_transform, coords[-1][0], coords[-1][1])
+            r = max(0, min(row, facc_arr.shape[0]-1))
+            c = max(0, min(col, facc_arr.shape[1]-1))
+            return facc_arr[r, c]
+            
+        catchment_areas = []
+        for _, row in gdf.iterrows():
+            try:
+                cells = _sample_facc(row.geometry)
+                catchment_areas.append(cells * (res ** 2))
+            except Exception:
+                catchment_areas.append(row["length_m"] * 500.0)
+                
+        # Use FACC derived area, but keep length-proxy as absolute minimum backup for edge cases
+        gdf["catchment_area_m2"] = np.maximum(catchment_areas, gdf["length_m"] * 500.0)
+    except Exception as e:
+        print(f"  Warning: Could not read Flow Accumulation ({e}), using proxy.")
+        gdf["catchment_area_m2"] = gdf["length_m"] * 500.0
+
     gdf["peak_flow_m3s"]     = C_runoff * i_m_s * gdf["catchment_area_m2"]
 
     # Manning's equation: Q = (1/n) * A * R^(2/3) * S^(1/2)
@@ -780,7 +891,7 @@ def visualise_results(dtm_path: str, streams_path: str,
     # ── Panel 3: Waterlogging Hotspots ────────────────────────────────────────
     ax = axes[1, 0]
     ax.imshow(dtm, cmap="terrain", extent=extent, origin="upper", alpha=0.6)
-    hs_path = dtm_path.replace("_DTM.tif", "_WaterloggingDepth.tif")
+    hs_path = dtm_path.replace("_DTM.tif", "_WaterloggingHotspots.tif")
     if os.path.exists(hs_path):
         with rasterio.open(hs_path) as src:
             hs = src.read(1).astype(float)
@@ -883,6 +994,10 @@ def run_pipeline_for_village(las_path: str, village_name: str,
             raise FileNotFoundError("No trained model found. Run with train_mode=True first.")
     df = classify_points(df, clf)
 
+    # 3.5. Save Ground Points
+    print("\n[Step 3.5] Saving Ground Points to LAS…")
+    ground_las_path = save_ground_points(df, village_name)
+
     # 4. DTM
     print("\n[Step 4] DTM Generation…")
     dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
@@ -894,7 +1009,8 @@ def run_pipeline_for_village(las_path: str, village_name: str,
     # 6. Drainage design parameters
     print("\n[Step 6] Drainage Design Parameters…")
     streams_path = hydro_paths.get("streams", "")
-    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, village_name)
+    facc_path    = hydro_paths.get("FlowAccumulation", "")
+    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
 
     # 7. Visualise
     print("\n[Step 7] Generating summary figure…")
@@ -929,6 +1045,10 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
     print("\n[Step 1] Loading ground points only (skipping ML – using existing labels)…")
     df = load_ground_only(las_path)
 
+    # 1.5 Save Ground Points
+    print("\n[Step 1.5] Saving Ground Points to LAS…")
+    ground_las_path = save_ground_points(df, village_name)
+
     # 2. DTM Generation
     print("\n[Step 2] DTM Generation…")
     dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
@@ -945,7 +1065,8 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
     # 4. Drainage design parameters
     print("\n[Step 4] Drainage Design Parameters…")
     streams_path = hydro_paths.get("streams", "")
-    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, village_name)
+    facc_path    = hydro_paths.get("FlowAccumulation", "")
+    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
 
     # 5. Visualise
     print("\n[Step 5] Generating summary figure…")

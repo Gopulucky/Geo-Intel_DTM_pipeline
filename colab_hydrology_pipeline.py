@@ -226,6 +226,31 @@ def render_colab_outputs(dtm_file, facc_file, streams_file, twi_file, sink_depth
 
 # --- MAIN RUNNER FOR COLAB ---
 
+def fix_raster_crs(target_tif, ref_tif):
+    """Ensure WBT outputs retain the CRS and GeoTransform of the input DTM."""
+    import rasterio
+    import os
+    import shutil
+    if not os.path.exists(target_tif): return
+    with rasterio.open(ref_tif) as src:
+        crs = src.crs
+        transform = src.transform
+    
+    with rasterio.open(target_tif) as src:
+        if src.crs == crs and src.transform == transform:
+            return
+        kwargs = src.meta.copy()
+        kwargs.update({
+            'crs': crs,
+            'transform': transform
+        })
+        data = src.read()
+    
+    tmp_tif = target_tif + ".tmp.tif"
+    with rasterio.open(tmp_tif, 'w', **kwargs) as dst:
+        dst.write(data)
+    shutil.move(tmp_tif, target_tif)
+
 def run_village_pipeline(work_dir: str, dtm_filename: str,
                          stream_threshold: int = 1000):
     """
@@ -249,11 +274,11 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     BREACHED_DTM   = f"{pfx}_BreachedDTM.tif"
     FDIR           = f"{pfx}_FlowDirection.tif"
     FACC           = f"{pfx}_FlowAccumulation.tif"
-    RASTER_STREAMS = f"{pfx}_RasterStreams.tif"
+    RASTER_STREAMS = f"{pfx}_DrainageNetwork.tif"
     VECTOR_STREAMS = f"{pfx}_Streams.shp"
     SLOPE          = f"{pfx}_Slope.tif"
     TWI            = f"{pfx}_TWI.tif"
-    WATER_DEPTH    = f"{pfx}_WaterDepth.tif"
+    WATER_DEPTH    = f"{pfx}_WaterloggingHotspots.tif"
     WATERSHEDS     = f"{pfx}_Catchments.tif"
 
     print(f"\n{'='*60}")
@@ -276,6 +301,10 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     )
     step4_waterlogging_hotspots(wbt, dtm_filename, BREACHED_DTM, TWI, SLOPE, WATER_DEPTH)
     step5_pour_points_and_catchments(wbt, FDIR, RASTER_STREAMS, WATERSHEDS)
+
+    print("⏳ Fixing projection metadata for GeoTIFFs...")
+    for out_tif in [BREACHED_DTM, FDIR, FACC, RASTER_STREAMS, SLOPE, TWI, WATER_DEPTH, WATERSHEDS]:
+        fix_raster_crs(os.path.join(work_dir, out_tif), dtm_path)
 
     print(f"\n🎉 {pfx} – ALL STEPS COMPLETED SUCCESSFULLY!")
 

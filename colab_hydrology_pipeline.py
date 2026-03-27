@@ -1,12 +1,5 @@
 import os
 import geopandas as gpd
-# COLAB HYDROLOGY PIPELINE
-# ------------------------
-# This script is specifically focused on the standalone hydrological analysis
-# and testing flow accumulation parameters. It is designed for interactive use
-# and parameter tuning in Colab.
-# For the full end-to-end processing (including Point Cloud ML classification,
-# DTM Generation, and final design parameters), use dtm_drainage_pipeline.py.
 from shapely.geometry import LineString, MultiLineString
 import rasterio
 import whitebox
@@ -252,11 +245,7 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
         return
 
     # ── Auto-generate output file names from the DTM prefix ──────────────────
-    if dtm_filename.endswith("_DTM.tif"):
-        pfx = dtm_filename[:-8]
-    else:
-        pfx = os.path.splitext(dtm_filename)[0]
-        
+    pfx            = dtm_filename.replace("_DTM.tif", "")
     BREACHED_DTM   = f"{pfx}_BreachedDTM.tif"
     FDIR           = f"{pfx}_FlowDirection.tif"
     FACC           = f"{pfx}_FlowAccumulation.tif"
@@ -313,8 +302,8 @@ if __name__ == "__main__":
         {"name": "64334_2H_REFLIGHT", "stream_threshold": 500},
         {"name": "PIRAYANKUPPAM", "stream_threshold": 500},
         {"name": "THANDALAM", "stream_threshold": 500},
-        {"name": "Gandhinagar_Diglipur", "stream_threshold": 200},
-        {"name": "Kadamtala_Rangat", "stream_threshold": 200},
+        {"name": "Gandhinagar_Diglipur", "stream_threshold": 500},
+        {"name": "Kadamtala_Rangat", "stream_threshold": 500},
     ]
 
     if len(sys.argv) > 1:

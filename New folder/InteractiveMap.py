@@ -34,6 +34,8 @@ USAGE (Google Colab / local):
 import os
 import warnings
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
@@ -317,9 +319,16 @@ def run_overlay_visualisation(
         if not path or not os.path.exists(path):
             return None
         gdf = gpd.read_file(path)
-        if dtm_crs and gdf.crs and gdf.crs != dtm_crs:
+        if gdf.empty:
+            return None
+        # FIX: WhiteboxTools often writes vectors without CRS.
+        # Assign the DTM CRS so Folium can reproject to EPSG:4326.
+        if gdf.crs is None and dtm_crs is not None:
+            gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
+            print(f"  [CRS FIX] Assigned {dtm_crs} to {os.path.basename(path)}")
+        elif dtm_crs and gdf.crs and gdf.crs != dtm_crs:
             gdf = gdf.to_crs(dtm_crs)
-        return gdf if not gdf.empty else None
+        return gdf
 
     streams_gdf  = _load_vec(streams_path)
     hotspots_gdf = _load_vec(hotspot_path)
@@ -445,18 +454,6 @@ def run_overlay_visualisation(
             overlay=False,
             control=True,
         ).add_to(m)
-        folium.TileLayer(
-            tiles="CartoDB dark_matter",
-            name="🌑 Dark Matter",
-            overlay=False,
-            control=True,
-        ).add_to(m)
-        folium.TileLayer(
-            tiles="OpenStreetMap",
-            name="🗺 OpenStreetMap",
-            overlay=False,
-            control=True,
-        ).add_to(m)
 
         # ── DTM elevation overlay (coloured raster) ───────────────────────────
         tw, th = 512, 512
@@ -522,36 +519,6 @@ def run_overlay_visualisation(
                     interactive=False, cross_origin=False,
                 ).add_to(m)
 
-        # ── Waterlogging depth overlay ────────────────────────────────────────
-        if wl_arr is not None:
-            wl_4326 = np.full((dtm_h, dtm_w), np.nan, dtype=np.float32)
-            with rasterio.open(wl_path) as src_wl:
-                reproject(
-                    source       = rasterio.band(src_wl, 1),
-                    destination  = wl_4326,
-                    src_transform= src_wl.transform,
-                    src_crs      = src_wl.crs,
-                    dst_transform= dtm_t,
-                    dst_crs      = "EPSG:4326",
-                    resampling   = Resampling.bilinear,
-                    src_nodata   = src_wl.nodata,
-                    dst_nodata   = np.nan,
-                )
-            wl_4326[wl_4326 <= 0.05] = np.nan
-            wl_m = np.ma.masked_invalid(wl_4326)
-            if wl_m.count() > 0:
-                norm_wl = mcolors.Normalize(
-                    vmin=np.nanpercentile(wl_4326[np.isfinite(wl_4326)], 2),
-                    vmax=np.nanpercentile(wl_4326[np.isfinite(wl_4326)], 98),
-                )
-                wl_rgba = cm.cool(norm_wl(wl_m))
-                wl_rgba[wl_m.mask, 3] = 0.0
-                folium.raster_layers.ImageOverlay(
-                    image=wl_rgba, bounds=f_bounds,
-                    opacity=0.60, name="🌊 Waterlogging Depth",
-                    interactive=False, cross_origin=False,
-                ).add_to(m)
-
         # ── Stream network (GeoJSON with tooltips) ────────────────────────────
         if streams_gdf is not None:
             streams_4326 = streams_gdf.to_crs("EPSG:4326")
@@ -575,6 +542,7 @@ def run_overlay_visualisation(
                     sticky=False,
                 ),
             ).add_to(m)
+
 
         # ── Waterlogging hotspots (polygons with popup) ───────────────────────
         if hotspots_gdf is not None:
@@ -702,3 +670,23 @@ if __name__ == "__main__":
             )
         else:
             print(f"Skipping {v['name']} - DTM file not found at {dtm_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WRAPPER FOR BACKEND
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_interactive_map(village_name: str, output_dir: str):
+    """Interactive Map wrapper for the web backend."""
+    print(f"🚀 Starting Interactive Map Generation for {village_name}...")
+    
+    dtm_path = os.path.join(output_dir, f"{village_name}_DTM.tif")
+    
+    run_overlay_visualisation(
+        village_name = village_name,
+        dtm_path     = dtm_path,
+        ortho_path   = None,
+        output_dir   = output_dir,
+        export_html  = True
+    )
+    print(f"✅ Interactive Map finished for {village_name}")

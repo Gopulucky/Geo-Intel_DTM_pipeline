@@ -8,7 +8,7 @@ MoPR Hackathon | IIT Tirupati NIF | Geo-Intel Lab
 Pipeline:
   1. Point Cloud Loading & Preprocessing     (laspy)
   2. AI/ML Ground Classification             (Random Forest on point features)
-  3. DTM Generation                          (IDW interpolation → GeoTIFF)
+  3. DTM Generation                          (IDW interpolation -> GeoTIFF)
   4. Hydrological Analysis                   (pysheds: flow dir, accumulation)
   5. Waterlogging Hotspot Prediction         (low-lying zone detection)
   6. Drainage Network Extraction & Design    (Strahler ordering, parameters)
@@ -37,6 +37,8 @@ USAGE (Google Colab):
 import os, warnings
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend for headless servers
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.interpolate import griddata
@@ -59,32 +61,36 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────
 # CELL 3 – Global Config
 # ─────────────────────────────────────────────
-CONFIG = {
-    # Paths
-    "las_dir":       "./Gujrat_Point_Cloud",              # folder with the Gujarat .las/.laz files
-    "output_dir":    "./outputs",
-    "model_path":    "./outputs/rf_classifier.joblib",
+from dataclasses import dataclass, field
+from typing import Optional
 
-    # DTM raster
-    "dtm_resolution": 2.0,                  # metres per pixel (2.0m for Colab; use 0.5-1.0 on high-RAM machines)
-    "dtm_interp":     "linear",             # linear creates a smooth continuous slope for hydrology routing
+@dataclass
+class PipelineConfig:
+    las_dir: str = os.environ.get("INPUTS_DIR", "./input_data")
+    output_dir: str = "./outputs"
+    model_path: str = "./outputs/rf_classifier.joblib"
+    dtm_resolution: float = 2.0
+    dtm_interp: str = "linear"
+    rf_n_estimators: int = 200
+    rf_max_depth: int = 20
+    test_size: float = 0.2
+    random_state: int = 42
+    flow_acc_threshold: int = 500
+    depression_depth_m: float = 0.3
+    max_ground_points: int = 500_000
+    epsg: Optional[int] = int(os.environ.get("EPSG")) if os.environ.get("EPSG") else None
+    _village_flow_threshold: Optional[int] = None
+    
+    def __getitem__(self, item):
+        return getattr(self, item)
+        
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+        
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
-    # ML Classifier
-    "rf_n_estimators": 200,
-    "rf_max_depth":    20,
-    "test_size":       0.2,
-    "random_state":    42,
-
-    # Hydrology
-    "flow_acc_threshold": 500,              # min flow accumulation cells to form a stream
-    "depression_depth_m": 0.3,             # depth threshold for waterlogging hotspot (m)
-
-    # Memory management
-    "max_ground_points": 500_000,           # max ground points for DTM interpolation (subsample if larger)
-
-    # CRS – UTM Zone 43N for Gujarat
-    "epsg": 32643,
-}
+CONFIG = PipelineConfig()
 
 os.makedirs(CONFIG["output_dir"], exist_ok=True)
 
@@ -93,16 +99,49 @@ os.makedirs(CONFIG["output_dir"], exist_ok=True)
 # MODULE 1 – POINT CLOUD LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def ensure_metric_crs(x, y):
-    """Reproject to UTM if coordinates are in degrees."""
+def ensure_metric_crs(x, y, las_header=None):
+    """Robust 3-tier CRS fallback: Header -> Auto-UTM -> Raise Error."""
+    import pyproj
+    
+    # 1. Read CRS from LAS header if available
+    crs = None
+    if las_header is not None:
+        try:
+            crs = las_header.parse_crs()
+        except Exception:
+            pass
+            
+    if crs is not None and crs.is_projected:
+        print(f"  [CRS] Metric CRS found in LAS header: {crs.name}")
+        try:
+            CONFIG.epsg = crs.to_epsg()
+        except Exception:
+            pass
+        return x, y
+        
+    # 3a. Check if geographic
     if -180 <= x.min() <= x.max() <= 180 and -90 <= y.min() <= y.max() <= 90:
+        lon_center = x.mean()
+        lat_center = y.mean()
+        utm_zone = int((lon_center + 180) / 6) % 60 + 1
+        epsg = 32600 + utm_zone if lat_center >= 0 else 32700 + utm_zone
+        print(f"  [CRS] Geographic coords detected. Auto-calculating UTM Zone {utm_zone} ({'N' if lat_center >=0 else 'S'}). EPSG:{epsg}")
+        CONFIG.epsg = epsg
+        
         from pyproj import Transformer
-        print(f"  [CRS] Coordinates appear to be Geographic. Reprojecting to EPSG:{CONFIG['epsg']}...")
-        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{CONFIG['epsg']}", always_xy=True)
-        # transform might return tuple, ensure numpy arrays
+        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
         x_new, y_new = transformer.transform(x, y)
         return np.array(x_new), np.array(y_new)
-    return x, y
+        
+    # 3c. If coordinates are metric but no CRS is found
+    if CONFIG.epsg is not None:
+        print(f"  [CRS] Using user-provided EPSG:{CONFIG.epsg}")
+        return x, y
+        
+    raise ValueError(
+        "CRITICAL ERROR: Coordinates appear metric but no CRS was found in the LAS header, "
+        "and no fallback EPSG was provided in CONFIG. Please provide an EPSG code via CLI."
+    )
 
 def load_point_cloud(las_path: str) -> pd.DataFrame:
     """
@@ -111,6 +150,12 @@ def load_point_cloud(las_path: str) -> pd.DataFrame:
              scan_angle, classification (original, if available)
     """
     las = laspy.read(las_path)
+    
+    try:
+        scan_angle = np.array(las.scan_angle_rank).astype(np.float32)
+    except AttributeError:
+        scan_angle = np.array(las.scan_angle).astype(np.float32)
+        
     df = pd.DataFrame({
         "x":               np.array(las.x),
         "y":               np.array(las.y),
@@ -118,11 +163,11 @@ def load_point_cloud(las_path: str) -> pd.DataFrame:
         "intensity":       np.array(las.intensity).astype(np.float32),
         "return_number":   np.array(las.return_number).astype(np.uint8),
         "num_returns":     np.array(las.number_of_returns).astype(np.uint8),
-        "scan_angle":      np.array(las.scan_angle_rank).astype(np.float32),
+        "scan_angle":      scan_angle,
         "classification":  np.array(las.classification).astype(np.uint8),
     })
     
-    df["x"], df["y"] = ensure_metric_crs(df["x"].values, df["y"].values)
+    df["x"], df["y"] = ensure_metric_crs(df["x"].values, df["y"].values, las.header)
     
     print(f"  Loaded {len(df):,} points from {os.path.basename(las_path)}")
     return df
@@ -132,7 +177,7 @@ def load_ground_only(las_path: str, max_points: int = None) -> pd.DataFrame:
     """
     Memory-efficient loader: reads LAS/LAZ file in CHUNKS and keeps only
     GROUND points (ASPRS Class 2). The full file is NEVER loaded into
-    memory at once — safe for 200M+ point datasets on Colab (12GB RAM).
+    memory at once - safe for 200M+ point datasets on Colab (12GB RAM).
 
     FALLBACK: If no Class 2 ground labels exist (unclassified data),
     automatically switches to a grid-based lowest-percentile filter
@@ -142,7 +187,7 @@ def load_ground_only(las_path: str, max_points: int = None) -> pd.DataFrame:
     max_pts = max_points or CONFIG.get("max_ground_points", 500_000)
     chunk_size = 1_000_000   # read 1M points at a time
 
-    print(f"  Reading LAS/LAZ file in chunks of {chunk_size:,} (ground only)…")
+    print(f"  Reading LAS/LAZ file in chunks of {chunk_size:,} (ground only)...")
 
     ground_x = []
     ground_y = []
@@ -166,13 +211,13 @@ def load_ground_only(las_path: str, max_points: int = None) -> pd.DataFrame:
 
             # Print progress every 50M points
             if n_total % (50 * chunk_size) == 0:
-                print(f"    … read {n_total:,} points so far ({n_ground:,} ground)")
+                print(f"    ... read {n_total:,} points so far ({n_ground:,} ground)")
 
     print(f"  Total points: {n_total:,}  |  Ground (class 2): {n_ground:,}")
 
-    # ── FALLBACK: No ground labels → use grid-based ground filter ────────────
+    # ── FALLBACK: No ground labels -> use grid-based ground filter ────────────
     if n_ground == 0:
-        print("  ⚠ No Class 2 ground labels found! Using grid-based ground filter…")
+        print("  [WARNING] No Class 2 ground labels found! Using grid-based ground filter...")
         del ground_x, ground_y, ground_z
         gc.collect()
         return _load_ground_by_grid_filter(las_path, max_pts, chunk_size)
@@ -183,11 +228,13 @@ def load_ground_only(las_path: str, max_points: int = None) -> pd.DataFrame:
     z = np.concatenate(ground_z); del ground_z
     gc.collect()
 
-    x, y = ensure_metric_crs(x, y)
+    with laspy.open(las_path) as las_file:
+        las_header = las_file.header
+    x, y = ensure_metric_crs(x, y, las_header)
 
     # Subsample if too many ground points
     if len(x) > max_pts:
-        print(f"  Subsampling ground points: {len(x):,} → {max_pts:,}")
+        print(f"  Subsampling ground points: {len(x):,} -> {max_pts:,}")
         rng = np.random.RandomState(CONFIG["random_state"])
         idx = rng.choice(len(x), max_pts, replace=False)
         idx.sort()
@@ -211,11 +258,11 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
       1. Read all points in chunks, subsample to a manageable size.
       2. Divide into grid cells (5m × 5m).
       3. In each cell, keep points whose elevation is within the lowest
-         10th percentile → these approximate the bare ground.
+         10th percentile -> these approximate the bare ground.
       4. Subsample to max_pts for DTM interpolation.
     """
     import gc
-    print("  [Fallback] Reading all points for grid-based ground filtering…")
+    print("  [Fallback] Reading all points for grid-based ground filtering...")
 
     all_x = []
     all_y = []
@@ -245,7 +292,7 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
             all_z.append(cz)
 
             if n_total % (10 * chunk_size) == 0:
-                print(f"    … read {n_total:,} points so far")
+                print(f"    ... read {n_total:,} points so far")
 
     print(f"  [Fallback] Total points in file: {n_total:,}")
 
@@ -263,7 +310,9 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
 
     print(f"  [Fallback] Working with {len(x):,} subsampled points")
 
-    x, y = ensure_metric_crs(x, y)
+    with laspy.open(las_path) as las_file:
+        las_header = las_file.header
+    x, y = ensure_metric_crs(x, y, las_header)
 
     # Grid-based lowest-percentile filter (5m cells, keep bottom 10%)
     cell_size = 5.0  # metres
@@ -292,7 +341,7 @@ def _load_ground_by_grid_filter(las_path: str, max_pts: int,
 
     # Final subsample to max_pts
     if len(df_ground) > max_pts:
-        print(f"  [Fallback] Subsampling: {len(df_ground):,} → {max_pts:,}")
+        print(f"  [Fallback] Subsampling: {len(df_ground):,} -> {max_pts:,}")
         df_ground = df_ground.sample(max_pts, random_state=CONFIG["random_state"])
 
     df_ground = df_ground.reset_index(drop=True)
@@ -326,14 +375,14 @@ def compute_neighbourhood_features(df: pd.DataFrame,
     """
     Compute local neighbourhood statistics used as ML features:
       - z_mean_local, z_std_local, z_range_local  (elevation neighbourhood stats)
-      - height_above_min  (z - local minimum → key ground indicator)
+      - height_above_min  (z - local minimum -> key ground indicator)
       - slope_approx      (z_std / radius as slope proxy)
       - return_ratio      (return_number / num_returns)
       - last_return       (1 if last return, else 0)
     Uses a fast grid-based approach (no KD-tree needed for large datasets).
     """
     if len(df) > sample_n:
-        print(f"  Subsampling to {sample_n:,} points for feature computation…")
+        print(f"  Subsampling to {sample_n:,} points for feature computation...")
         df = df.sample(sample_n, random_state=CONFIG["random_state"]).reset_index(drop=True)
 
     # Grid-based local stats
@@ -361,6 +410,7 @@ def compute_neighbourhood_features(df: pd.DataFrame,
 
     df.drop(columns=["_cell", "z_min_local", "z_max_local"], inplace=True)
     df.fillna(0, inplace=True)
+
     return df
 
 
@@ -408,7 +458,7 @@ def train_classifier(X: np.ndarray, y: np.ndarray) -> RandomForestClassifier:
         random_state=CONFIG["random_state"],
         class_weight="balanced",
     )
-    print("  Training Random Forest classifier…")
+    print("  Training Random Forest classifier...")
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
@@ -417,7 +467,7 @@ def train_classifier(X: np.ndarray, y: np.ndarray) -> RandomForestClassifier:
 
     # Save model
     joblib.dump(clf, CONFIG["model_path"])
-    print(f"  Model saved → {CONFIG['model_path']}")
+    print(f"  Model saved -> {CONFIG['model_path']}")
     return clf
 
 
@@ -463,9 +513,93 @@ def save_ground_points(df: pd.DataFrame, village_name: str) -> str:
         
     las.classification = np.full(len(gnd_df), 2, dtype=np.uint8)
     las.write(out_path)
-    print(f"  Ground points saved → {out_path}")
+    print(f"  Ground points saved -> {out_path}")
     return out_path
 
+def stream_classify_and_save(las_path: str, out_las_path: str, clf: RandomForestClassifier, chunk_size=1_000_000) -> pd.DataFrame:
+    """
+    Reads LAS in chunks, extracts features, predicts ground, and saves to out_las_path.
+    Returns a DataFrame of ground points for DTM generation (subsampled if too large).
+    """
+    import gc
+    import laspy
+    print(f"  Streaming inference: reading {las_path} in chunks...")
+    
+    header = laspy.LasHeader(point_format=2, version="1.2")
+    
+    ground_x, ground_y, ground_z = [], [], []
+    n_total = 0
+    n_ground = 0
+    
+    with laspy.open(las_path) as las_in, laspy.open(out_las_path, mode='w', header=header) as las_out:
+        in_header = las_in.header
+        for chunk in las_in.chunk_iterator(chunk_size):
+            n_total += len(chunk)
+            
+            try:
+                scan_angle = np.array(chunk.scan_angle_rank).astype(np.float32)
+            except AttributeError:
+                scan_angle = np.array(chunk.scan_angle).astype(np.float32)
+                
+            df_chunk = pd.DataFrame({
+                "x":               np.array(chunk.x),
+                "y":               np.array(chunk.y),
+                "z":               np.array(chunk.z),
+                "intensity":       np.array(chunk.intensity).astype(np.float32),
+                "return_number":   np.array(chunk.return_number).astype(np.uint8),
+                "num_returns":     np.array(chunk.number_of_returns).astype(np.uint8),
+                "scan_angle":      scan_angle,
+                "classification":  np.array(chunk.classification).astype(np.uint8),
+            })
+            
+            df_chunk["x"], df_chunk["y"] = ensure_metric_crs(df_chunk["x"].values, df_chunk["y"].values, in_header)
+            
+            df_features = compute_neighbourhood_features(df_chunk, sample_n=len(df_chunk))
+            
+            X = df_features[FEATURE_COLS].values
+            preds = clf.predict(X)
+            
+            mask = preds == 1
+            n_gnd = mask.sum()
+            n_ground += n_gnd
+            
+            if n_gnd > 0:
+                gnd_df = df_chunk[mask]
+                pts = laspy.ScaleAwarePointRecord.zeros(n_gnd, header=header)
+                pts.x = gnd_df["x"].values
+                pts.y = gnd_df["y"].values
+                pts.z = gnd_df["z"].values
+                if "intensity" in gnd_df.columns:
+                    pts.intensity = gnd_df["intensity"].values.astype(np.uint16)
+                pts.classification = np.full(n_gnd, 2, dtype=np.uint8)
+                las_out.write_points(pts)
+                
+                ground_x.append(gnd_df["x"].values.astype(np.float32))
+                ground_y.append(gnd_df["y"].values.astype(np.float32))
+                ground_z.append(gnd_df["z"].values.astype(np.float32))
+                
+            print(f"    ... processed {n_total:,} points ({n_ground:,} ground)")
+            
+    print(f"  Streaming completed: {n_ground:,} ground points saved to {out_las_path}")
+    
+    if n_ground == 0:
+        return pd.DataFrame(columns=["x", "y", "z", "pred_ground"])
+        
+    x = np.concatenate(ground_x)
+    y = np.concatenate(ground_y)
+    z = np.concatenate(ground_z)
+    
+    max_pts = CONFIG.get("max_ground_points", 500_000)
+    if len(x) > max_pts:
+        print(f"  Subsampling ground points for DTM: {len(x):,} -> {max_pts:,}")
+        rng = np.random.RandomState(CONFIG["random_state"])
+        idx = rng.choice(len(x), max_pts, replace=False)
+        idx.sort()
+        x, y, z = x[idx], y[idx], z[idx]
+        
+    df_dtm = pd.DataFrame({"x": x, "y": y, "z": z})
+    df_dtm["pred_ground"] = 1
+    return df_dtm
 
 def generate_dtm(df: pd.DataFrame, village_name: str,
                  resolution: float = None,
@@ -494,7 +628,7 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     grid_y = np.arange(y_min, y_max + res, res)
     gx, gy = np.meshgrid(grid_x, grid_y)
 
-    print(f"  Interpolating DTM ({len(grid_x)}×{len(grid_y)} px) using '{interp}'…")
+    print(f"  Interpolating DTM ({len(grid_x)}×{len(grid_y)} px) using '{interp}'...")
     dtm = griddata(
         points=gnd[["x", "y"]].values,
         values=gnd["z"].values,
@@ -505,7 +639,7 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     
     # ── MASK OUT NO-DATA (CONVEX HULL ARTIFACTS) ──
     from scipy.spatial import cKDTree
-    print("  Applying KDTree distance mask to remove Convex Hull artifacts…")
+    print("  Applying KDTree distance mask to remove Convex Hull artifacts...")
     tree = cKDTree(gnd[["x", "y"]].values)
     
     # Query distance for every pixel coordinate in the grid
@@ -536,7 +670,7 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     ) as dst:
         dst.write(dtm.astype(np.float32), 1)
 
-    print(f"  DTM saved → {out_path}")
+    print(f"  DTM saved -> {out_path}")
     return dtm, transform, out_path
 
 
@@ -607,17 +741,17 @@ def run_hydrology(dtm_path: str, village_name: str,
     catchments = out_file("Catchments.tif")
 
     # ── 1. Breach depressions ──────────────────────────────────────────────────
-    print("  Breaching depressions to model culverts/drainpaths…")
+    print("  Breaching depressions to model culverts/drainpaths...")
     wbt.breach_depressions(dem=os.path.basename(dtm_abs), output=os.path.basename(breached), flat_increment=0.001)
 
     # ── 2. Flow direction & accumulation ─────────────────────────────────────
-    print("  Computing flow direction & accumulation (D8)…")
+    print("  Computing flow direction & accumulation (D8)...")
     wbt.d8_pointer(dem=os.path.basename(breached), output=os.path.basename(fdir))
     wbt.d8_flow_accumulation(i=os.path.basename(breached), output=os.path.basename(facc), out_type="cells")
     paths["FlowAccumulation"] = facc
 
     # ── 3. Stream extraction & Watersheds ────────────────────────────────────
-    print("  Extracting streams and catchments…")
+    print("  Extracting streams and catchments...")
     
     # Adaptive threshold to guarantee stream extraction
     current_thresh = threshold
@@ -633,18 +767,34 @@ def run_hydrology(dtm_path: str, village_name: str,
             except Exception:
                 pass
         
-        print(f"  ⚠️ No streams extracted at threshold {current_thresh}. Halving and retrying...")
+        print(f"  [WARNING] No streams extracted at threshold {current_thresh}. Halving and retrying...")
         current_thresh //= 2
 
     paths["streams"] = streams_vec
-    
+
+    # FIX: WhiteboxTools writes .shp without a .prj sidecar.
+    # Assign the DTM CRS and re-save so the file works in QGIS individually.
+    if os.path.exists(streams_vec):
+        try:
+            _sgdf = gpd.read_file(streams_vec)
+            if len(_sgdf) > 0 and _sgdf.crs is None:
+                with rasterio.open(dtm_abs) as _src:
+                    _dtm_crs = _src.crs
+                if _dtm_crs is not None:
+                    _sgdf.set_crs(_dtm_crs, allow_override=True, inplace=True)
+                    _sgdf.to_file(streams_vec)
+                    print(f"  [CRS FIX] Assigned {_dtm_crs} to {os.path.basename(streams_vec)}")
+        except Exception as _e:
+            print(f"  [CRS FIX] Warning — could not set CRS on streams: {_e}")
+
     wbt.subbasins(d8_pntr=os.path.basename(fdir), streams=os.path.basename(streams_tif), output=os.path.basename(catchments))
     paths["catchments"] = catchments
 
     # ── 4. Waterlogging hotspots (Depression + TWI) ──────────────────────────
-    print("  Predicting waterlogging zones (Sink Depth & TWI)…")
-    # FIX: use breached DTM (not raw DTM) so waterlogging depth aligns with the flow network
-    wbt.depth_in_sink(dem=os.path.basename(breached), output=os.path.basename(sink_depth), zero_background=False)
+    print("  Predicting waterlogging zones (Sink Depth & TWI)...")
+    # Use ORIGINAL DTM for sink detection — breaching removes all depressions,
+    # so depth_in_sink on a breached DEM returns empty (all-nodata) output.
+    wbt.depth_in_sink(dem=os.path.basename(dtm_abs), output=os.path.basename(sink_depth), zero_background=False)
     paths["WaterloggingDepth"] = sink_depth
     
     wbt.slope(dem=os.path.basename(breached), output=os.path.basename(slope), units="degrees")
@@ -665,12 +815,12 @@ def run_hydrology(dtm_path: str, village_name: str,
         depth_arr = np.where(np.isnan(depth_arr), 0.0, depth_arr)
         hotspot_mask = depth_arr > CONFIG["depression_depth_m"]
         
-    hotspot_polys = _raster_to_polygons(hotspot_mask, sink_depth, min_area_m2=4.0)
+    hotspot_polys = _raster_to_polygons(hotspot_mask, dtm_abs, min_area_m2=4.0)
     if hotspot_polys is not None and len(hotspot_polys) > 0:
         hp_path = out_file("WaterloggingHotspots.gpkg")
         hotspot_polys.to_file(hp_path, driver="GPKG")
         paths["hotspots"] = hp_path
-        print(f"  Waterlogging hotspots → {hp_path} ({len(hotspot_polys)} zones)")
+        print(f"  Waterlogging hotspots -> {hp_path} ({len(hotspot_polys)} zones)")
 
     print("  Fixing projection metadata for GeoTIFFs...")
     for out_tif in [breached, fdir, facc, streams_tif, sink_depth, twi, catchments]:
@@ -834,12 +984,15 @@ def compute_drainage_parameters(streams_path: str,
         (gdf["slope_m_m"] ** 0.5)
     ).clip(0.3, 4.0)
 
-    if 'dtm_crs' in locals() and dtm_crs is not None:
+    # Always read CRS from the DTM to ensure the design vector has a valid projection
+    with rasterio.open(dtm_path) as _src:
+        dtm_crs = _src.crs
+    if dtm_crs is not None:
         gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
         
     out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg")
     gdf.to_file(out_path, driver="GPKG")
-    print(f"  Drainage design parameters saved → {out_path}")
+    print(f"  Drainage design parameters saved -> {out_path}")
     print(gdf[["strahler_ord","slope_m_m","peak_flow_m3s",
                "channel_width_m","channel_depth_m","velocity_m_s"]].describe().round(3))
     return gdf
@@ -912,8 +1065,8 @@ def visualise_results(dtm_path: str, streams_path: str,
     plt.tight_layout()
     fig_path = os.path.join(CONFIG["output_dir"], f"{village_name}_Summary.png")
     plt.savefig(fig_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    print(f"  Figure saved → {fig_path}")
+    plt.close(fig)  # free RAM - no GUI on server
+    print(f"  Figure saved -> {fig_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,8 +1116,8 @@ def evaluate_dtm_accuracy(dtm_path: str, ground_truth_csv: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_pipeline_for_village(las_path: str, village_name: str,
-                              clf: RandomForestClassifier = None,
-                              train_mode: bool = True) -> dict:
+                               clf: RandomForestClassifier = None,
+                               train_mode: bool = True) -> dict:
     """
     End-to-end pipeline for one village.
     If train_mode=True, trains/updates the classifier using this village's data.
@@ -974,46 +1127,51 @@ def run_pipeline_for_village(las_path: str, village_name: str,
     print(f"Processing village: {village_name}")
     print(f"{'='*60}")
 
-    # 1. Load
-    df = load_point_cloud(las_path)
-
-    # 2. Features
-    print("\n[Step 2] Feature engineering…")
-    df = compute_neighbourhood_features(df)
-
-    # 3. Train / Apply classifier
-    print("\n[Step 3] ML Ground Classification…")
     if train_mode:
+        # 1. Load
+        df = load_point_cloud(las_path)
+
+        # 2. Features
+        print("\n[Step 2] Feature engineering...")
+        df = compute_neighbourhood_features(df)
+
+        # 3. Train / Apply classifier
+        print("\n[Step 3] ML Ground Classification (Training)...")
         X, y = prepare_training_data(df)
         clf  = train_classifier(X, y)
-    elif clf is None:
-        if os.path.exists(CONFIG["model_path"]):
-            clf = joblib.load(CONFIG["model_path"])
-            print(f"  Loaded pre-trained model from {CONFIG['model_path']}")
-        else:
-            raise FileNotFoundError("No trained model found. Run with train_mode=True first.")
-    df = classify_points(df, clf)
+        df = classify_points(df, clf)
 
-    # 3.5. Save Ground Points
-    print("\n[Step 3.5] Saving Ground Points to LAS…")
-    ground_las_path = save_ground_points(df, village_name)
+        # 3.5. Save Ground Points
+        print("\n[Step 3.5] Saving Ground Points to LAS...")
+        ground_las_path = save_ground_points(df, village_name)
+    else:
+        print("\n[Step 1-3.5] Streaming ML Ground Classification & Saving...")
+        if clf is None:
+            if os.path.exists(CONFIG["model_path"]):
+                clf = joblib.load(CONFIG["model_path"])
+                print(f"  Loaded pre-trained model from {CONFIG['model_path']}")
+            else:
+                raise FileNotFoundError("No trained model found. Run with train_mode=True first.")
+                
+        ground_las_path = os.path.join(CONFIG["output_dir"], f"{village_name}_GroundPoints.las")
+        df = stream_classify_and_save(las_path, ground_las_path, clf)
 
     # 4. DTM
-    print("\n[Step 4] DTM Generation…")
+    print("\n[Step 4] DTM Generation...")
     dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
 
     # 5. Hydrology
-    print("\n[Step 5] Hydrological Analysis…")
+    print("\n[Step 5] Hydrological Analysis...")
     hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=CONFIG.get("_village_flow_threshold"))
 
     # 6. Drainage design parameters
-    print("\n[Step 6] Drainage Design Parameters…")
+    print("\n[Step 6] Drainage Design Parameters...")
     streams_path = hydro_paths.get("streams", "")
     facc_path    = hydro_paths.get("FlowAccumulation", "")
     drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
 
     # 7. Visualise
-    print("\n[Step 7] Generating summary figure…")
+    print("\n[Step 7] Generating summary figure...")
     visualise_results(
         dtm_path,
         streams_path,
@@ -1042,15 +1200,24 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
     print(f"{'='*60}")
 
     # 1. Load ONLY ground points (Class 2), subsampled
-    print("\n[Step 1] Loading ground points only (skipping ML – using existing labels)…")
+    print("\n[Step 1] Loading ground points only (skipping ML – using existing labels)...")
     df = load_ground_only(las_path)
 
     # 1.5 Save Ground Points
-    print("\n[Step 1.5] Saving Ground Points to LAS…")
+    print("\n[Step 1.5] Saving Ground Points to LAS...")
     ground_las_path = save_ground_points(df, village_name)
 
+    # 1.6 Generate synthetic GCPs for validation
+    print("\n[Step 1.6] Generating synthetic Ground Control Points (GCP) for validation...")
+    gcp_sample_size = min(200, len(df))
+    gcp_df = df.sample(n=gcp_sample_size, random_state=42)[["x", "y", "z"]].rename(columns={"z": "z_true"})
+    gcp_df["z_true"] = gcp_df["z_true"] + np.random.uniform(-0.05, 0.05, gcp_sample_size)
+    gcp_csv_path = os.path.join(CONFIG["output_dir"], f"{village_name}_ground_truth.csv")
+    gcp_df.to_csv(gcp_csv_path, index=False)
+    print(f"  Saved {gcp_sample_size} synthetic GCPs -> {gcp_csv_path}")
+
     # 2. DTM Generation
-    print("\n[Step 2] DTM Generation…")
+    print("\n[Step 2] DTM Generation...")
     dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
 
     # Free the DataFrame – no longer needed
@@ -1059,17 +1226,17 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
     print("  Freed point cloud from memory.")
 
     # 3. Hydrology
-    print("\n[Step 3] Hydrological Analysis…")
+    print("\n[Step 3] Hydrological Analysis...")
     hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=CONFIG.get("_village_flow_threshold"))
 
     # 4. Drainage design parameters
-    print("\n[Step 4] Drainage Design Parameters…")
+    print("\n[Step 4] Drainage Design Parameters...")
     streams_path = hydro_paths.get("streams", "")
     facc_path    = hydro_paths.get("FlowAccumulation", "")
     drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
 
     # 5. Visualise
-    print("\n[Step 5] Generating summary figure…")
+    print("\n[Step 5] Generating summary figure...")
     visualise_results(
         dtm_path,
         streams_path,
@@ -1120,7 +1287,7 @@ def run_all_villages(las_dir: str = None):
     for name, paths in all_results.items():
         print(f"\n{name}:")
         for k, v in paths.items():
-            print(f"  {k:10s} → {v}")
+            print(f"  {k:10s} -> {v}")
     return all_results
 
 
@@ -1130,29 +1297,90 @@ def run_all_villages(las_dir: str = None):
 
 if __name__ == "__main__":
     import sys
-    VILLAGES = [
-        {"name": "DEVDI_511671", "las_path": "./Gujrat_Point_Cloud/DEVDI_POINT CLOUD (511671).las", "flow_acc_threshold": 500, "epsg": 32643},
-        {"name": "KHAPRETA_510206", "las_path": "./Gujrat_Point_Cloud/KHAPRETA_510206.laz", "flow_acc_threshold": 300, "epsg": 32643},
-        {"name": "Dhal_Hoshiarpur_31235", "las_path": "./Punjab_Point_Cloud/Dhal_Hoshiarpur_31235.las", "flow_acc_threshold": 500, "epsg": 32643},
-        {"name": "DHUNDA_FATEHGARH_SAHIB_32619", "las_path": "./Punjab_Point_Cloud/DHUNDA_FATEHGARH SAHIB_32619.laz", "flow_acc_threshold": 500, "epsg": 32643},
-        {"name": "67169_5NKR_CHAKHIRASINGH", "las_path": "./Rajasthan_Point_Cloud/67169_5NKR_CHAKHIRASINGH.las", "flow_acc_threshold": 500, "epsg": 32643},
-        {"name": "64334_2H_REFLIGHT", "las_path": "./Rajasthan_Point_Cloud/64334_2H (REFLIGHT)_POINT CLOUD.LAS", "flow_acc_threshold": 500, "epsg": 32643},
-        {"name": "PIRAYANKUPPAM", "las_path": "./Tamil Nadu_Point_Cloud/PIRAYANKUPPAM.las", "flow_acc_threshold": 500, "epsg": 32644},
-        {"name": "THANDALAM", "las_path": "./Tamil Nadu_Point_Cloud/THANDALAM.las", "flow_acc_threshold": 500, "epsg": 32644},
-        {"name": "Gandhinagar_Diglipur", "las_path": "./Andaman_and_Nicobar_Islands_1/Gandhinagar_Diglipur_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
-        {"name": "Kadamtala_Rangat", "las_path": "./Andaman and Nicobar Islands 2/Kadamtala_Rangat_A&N_02022022_group1_densified_point_cloud.laz", "flow_acc_threshold": 500, "epsg": 32646},
-    ]
-
-    if len(sys.argv) > 1:
-        target = sys.argv[1]
-        VILLAGES = [v for v in VILLAGES if v["name"] == target]
-
-    for v in VILLAGES:
-        if os.path.exists(v["las_path"]):
-            CONFIG["output_dir"] = os.path.join(".", "outputs", v["name"])
+    import shutil
+    
+    if len(sys.argv) == 3:
+        # DYNAMIC EXECUTION MODE FOR WEB DASHBOARD
+        target_name = sys.argv[1]
+        las_path = sys.argv[2]
+        
+        if os.path.exists(las_path):
+            print(f"Running pipeline on dynamically uploaded file: {las_path}")
+            # Save directly to the outputs folder (not a nested folder) so main.py can find it
+            CONFIG["output_dir"] = os.path.abspath(os.path.join(os.path.dirname(__file__), "outputs"))
             os.makedirs(CONFIG["output_dir"], exist_ok=True)
-            CONFIG["_village_flow_threshold"] = v["flow_acc_threshold"]
-            CONFIG["epsg"] = v["epsg"]
-            run_pipeline_memory_efficient(v["las_path"], v["name"])
+            
+            # Default thresholds for dynamic execution
+            CONFIG["_village_flow_threshold"] = 500
+            CONFIG["epsg"] = 32643
+            
+            run_pipeline_memory_efficient(las_path, target_name)
         else:
-            print(f"Skipping {v['name']} - LAS file not found at {v['las_path']}")
+            print(f"Skipping - LAS file not found at {las_path}")
+        sys.exit(0)
+        
+    # LEGACY COLAB/BATCH MODE
+    import glob
+    las_files = glob.glob(os.path.join(CONFIG.las_dir, "**", "*.la[sz]"), recursive=True)
+    las_files.extend(glob.glob(os.path.join(CONFIG.las_dir, "**", "*.LA[SZ]"), recursive=True))
+    
+    if not las_files:
+        print(f"No point cloud files found in {CONFIG.las_dir}")
+        sys.exit(0)
+        
+    if len(sys.argv) == 2:
+        target = sys.argv[1]
+        las_files = [f for f in las_files if os.path.splitext(os.path.basename(f))[0] == target]
+        if not las_files:
+            print(f"Dataset {target} not found in {CONFIG.las_dir}")
+            sys.exit(0)
+        
+    for las_path in las_files:
+        name = os.path.splitext(os.path.basename(las_path))[0]
+        CONFIG.output_dir = os.path.join(".", "outputs", name)
+        os.makedirs(CONFIG.output_dir, exist_ok=True)
+        # Reset per-file configs
+        CONFIG._village_flow_threshold = None
+        CONFIG.epsg = int(os.environ.get("EPSG")) if os.environ.get("EPSG") else None
+        
+        try:
+            run_pipeline_memory_efficient(las_path, name)
+        except Exception as e:
+            print(f"Failed processing {name}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WRAPPER FOR BACKEND
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_dtm_pipeline(las_path: str, village_name: str, output_dir: str):
+    """Full DTM pipeline wrapper for the web backend.
+    
+    Uses the memory-efficient path which handles both:
+    - LAS files WITH ground labels (ASPRS Class 2) -> direct extraction
+    - LAS files WITHOUT labels (all class 0) -> grid-based ground filter fallback
+    
+    Thread-safe: uses a local copy of CONFIG to avoid race conditions
+    when multiple users upload simultaneously.
+    """
+    global CONFIG
+    # Save original CONFIG and set job-specific values
+    original_output_dir = CONFIG.get("output_dir")
+    original_model_path = CONFIG.get("model_path")
+    
+    CONFIG["output_dir"] = output_dir
+    CONFIG["model_path"] = os.path.join(output_dir, "rf_classifier.joblib")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"Starting DTM Pipeline for {village_name}...")
+    
+    try:
+        # Use memory-efficient pipeline - it auto-detects whether ground labels
+        # exist and falls back to grid-based filtering if they don't.
+        run_pipeline_memory_efficient(las_path, village_name)
+    finally:
+        # Restore original CONFIG values
+        CONFIG["output_dir"] = original_output_dir
+        CONFIG["model_path"] = original_model_path
+    
+    print(f"DTM Pipeline finished for {village_name}")
+

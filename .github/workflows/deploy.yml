@@ -1,0 +1,67 @@
+name: Deploy Geo-Intel Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy-backend:
+    name: Deploy Backend → HuggingFace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install HuggingFace CLI
+        run: pip install huggingface_hub
+
+      - name: Push backend to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -c "
+          from huggingface_hub import HfApi
+          import os
+          api = HfApi(token=os.environ['HF_TOKEN'])
+          api.upload_folder(
+              folder_path='./backend',
+              repo_id='YOUR_HF_USERNAME/geo-intel-dtm-api',
+              repo_type='space',
+              ignore_patterns=['__pycache__', '*.pyc', '.git']
+          )
+          print('Backend deployed to HuggingFace!')
+          "
+
+  deploy-frontend:
+    name: Deploy Frontend → Vercel
+    runs-on: ubuntu-latest
+    needs: deploy-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install and Build Frontend
+        working-directory: ./frontend
+        run: |
+          npm install
+          npm run build
+        env:
+          VITE_API_URL: https://YOUR_HF_USERNAME-geo-intel-dtm-api.hf.space
+
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          working-directory: ./frontend
+          vercel-args: '--prod'

@@ -1,43 +1,19 @@
-# Python
+# Node.js / Frontend
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+build/
+.env
+
+# Python / Backend
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-
-# Environment
-.env
+.venv/
 venv/
 env/
-.venv/
-
-# Outputs and Generated Data
-outputs/
-All_Village_Summaries/
-
-# Raw and Processed Geospatial Data (Point Clouds, Rasters, Vectors)
-*Point_Cloud*/
-Andaman and Nicobar Islands 2/
-Andaman_and_Nicobar_Islands_1/
-Gujrat_Point_Cloud/
-Punjab_Point_Cloud/
-Rajasthan_Point_Cloud/
-Tamil Nadu_Point_Cloud/
-*.las
-*.laz
-*.tif
-*.tiff
-*.png
-*.jpg
-*.geojson
-*.shp
-*.shx
-*.dbf
-*.prj
-*.qgz
-*.gpkg
-
-# Logs
-*.log
+*.sqlite3
 
 # OS generated files
 .DS_Store

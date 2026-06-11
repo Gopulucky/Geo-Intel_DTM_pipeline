@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Geo-Intel DTM Pipeline — PS2 Final Hackathon</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    /*
+     * ─── PROFESSIONAL GIS PRESENTATION PALETTE ───────────────
+     *
+     *  Base (60%)     Deep navy #0a1628  — authority, depth, focus
+     *  Support (30%)  Slate blue #1e3a5f / mist #94a3b8 — structure, text
+     *  Accent (10%)   Emerald #34d399  — terrain, success, CTA
+     *                 Sky #38bdf8     — water, hydrology
+     *                 Amber #fbbf24   — risk, warning
+     *                 Violet #a78bfa  — AI/ML, technology
+     *
+     *  Based on: Modern Tech Navy + Data-Viz palettes
+     *  Rule: 60-30-10 distribution for professional readability
+     */
+    :root {
+      /* 60% — Deep navy base */
+      --bg:          #0a1628;
+      --bg-card:     #0f1f38;
+      --bg-elevated: #142849;
+
+      /* 30% — Supporting structure */
+      --ink:         #e8ecf1;
+      --muted:       #94a3b8;
+      --faint:       #64748b;
+      --border:      rgba(148,163,184,.12);
+      --glass:       rgba(15,31,56,.7);
+
+      /* 10% — Semantic accent colors */
+      --emerald:     #34d399;
+      --emerald-bg:  rgba(52,211,153,.08);
+      --emerald-mid: rgba(52,211,153,.20);
+      --sky:         #38bdf8;
+      --sky-bg:      rgba(56,189,248,.08);
+      --sky-mid:     rgba(56,189,248,.20);
+      --amber:       #fbbf24;
+      --amber-bg:    rgba(251,191,36,.08);
+      --amber-mid:   rgba(251,191,36,.20);
+      --violet:      #a78bfa;
+      --violet-bg:   rgba(167,139,250,.08);
+      --violet-mid:  rgba(167,139,250,.20);
+
+      --radius:      14px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Subtle ambient gradients — navy depth */
+    body::after {
+      content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background:
+        radial-gradient(ellipse 70% 50% at 0% 0%, rgba(30,58,95,.6), transparent 60%),
+        radial-gradient(ellipse 50% 40% at 100% 100%, rgba(52,211,153,.04), transparent 50%),
+        radial-gradient(ellipse 40% 30% at 50% 80%, rgba(56,189,248,.03), transparent 40%);
+    }
+
+    /* ═══════════════════════════════════════════
+       SLIDE ENGINE
+       ═══════════════════════════════════════════ */
+    .deck { height: 100%; position: relative; z-index: 1; }
+
+    .slide {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      justify-content: center; align-items: center;
+      padding: 54px 72px 38px;
+      opacity: 0; transform: translateY(22px);
+      transition: opacity .5s cubic-bezier(.4,0,.2,1), transform .5s cubic-bezier(.4,0,.2,1);
+      pointer-events: none; text-align: center;
+    }
+    .slide.active { opacity: 1; transform: translateY(0); pointer-events: auto; }
+    .slide.left { text-align: left; align-items: flex-start; }
+
+    /* ═══════════════════════════════════════════
+       TYPOGRAPHY
+       ═══════════════════════════════════════════ */
+    .tag {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11.5px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .15em; margin-bottom: 22px;
+      padding: 7px 18px; border-radius: 100px;
+      border: 1px solid;
+    }
+    .tag--emerald { color: var(--emerald); background: var(--emerald-bg); border-color: var(--emerald-mid); }
+    .tag--sky     { color: var(--sky);     background: var(--sky-bg);     border-color: var(--sky-mid); }
+    .tag--amber   { color: var(--amber);   background: var(--amber-bg);   border-color: var(--amber-mid); }
+    .tag--violet  { color: var(--violet);  background: var(--violet-bg);  border-color: var(--violet-mid); }
+
+    h1 {
+      font-size: clamp(40px, 5.2vw, 72px); font-weight: 900;
+      line-height: 1.04; letter-spacing: -.035em; max-width: 900px;
+    }
+    h2 {
+      font-size: clamp(26px, 3.4vw, 46px); font-weight: 700;
+      line-height: 1.1; letter-spacing: -.025em; max-width: 860px;
+    }
+    h3 {
+      font-size: 20px; font-weight: 700; line-height: 1.15;
+    }
+
+    .subtitle {
+      color: var(--muted); font-size: clamp(15px, 1.7vw, 20px);
+      line-height: 1.6; max-width: 660px; margin-top: 16px;
+    }
+    .subtitle strong { color: var(--ink); font-weight: 600; }
+
+    /* Colored inline highlights */
+    .hl-emerald { color: var(--emerald); }
+    .hl-sky     { color: var(--sky); }
+    .hl-amber   { color: var(--amber); }
+    .hl-violet  { color: var(--violet); }
+
+    /* Technical terms — bold + dotted underline, hover shows tooltip */
+    .term {
+      font-weight: 700; border-bottom: 1.5px dotted; cursor: help;
+      position: relative; transition: opacity .2s;
+    }
+    .term--emerald { color: var(--emerald); border-color: var(--emerald-mid); }
+    .term--sky     { color: var(--sky);     border-color: var(--sky-mid); }
+    .term--amber   { color: var(--amber);   border-color: var(--amber-mid); }
+    .term--violet  { color: var(--violet);  border-color: var(--violet-mid); }
+
+    .term .tip {
+      display: none; position: absolute; bottom: calc(100% + 10px);
+      left: 50%; transform: translateX(-50%);
+      background: var(--bg-elevated); color: var(--ink);
+      font-size: 12px; font-weight: 500; white-space: nowrap;
+      padding: 8px 14px; border-radius: 10px;
+      border: 1px solid var(--border);
+      box-shadow: 0 12px 40px rgba(0,0,0,.5);
+      z-index: 60; pointer-events: none;
+      letter-spacing: 0; text-transform: none;
+    }
+    .term:hover .tip { display: block; }
+
+    /* Inline simple explanation after tech term */
+    .explain { color: var(--muted); font-weight: 400; }
+
+    /* ═══════════════════════════════════════════
+       CARD SYSTEM
+       ═══════════════════════════════════════════ */
+    .grid {
+      display: grid; gap: 16px; width: 100%; max-width: 1020px;
+      margin-top: 28px;
+    }
+    .grid.c2 { grid-template-columns: repeat(2, 1fr); }
+    .grid.c3 { grid-template-columns: repeat(3, 1fr); }
+    .grid.c4 { grid-template-columns: repeat(4, 1fr); }
+
+    .card {
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 24px 22px; text-align: left;
+      transition: border-color .3s, transform .3s, box-shadow .3s;
+      position: relative; overflow: hidden;
+    }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 16px 48px rgba(0,0,0,.3); }
+
+    /* Top colored accent stripe */
+    .card::before {
+      content: ""; position: absolute; top: 0; left: 0; right: 0;
+      height: 3px;
+    }
+    .card--emerald::before { background: var(--emerald); }
+    .card--sky::before     { background: var(--sky); }
+    .card--amber::before   { background: var(--amber); }
+    .card--violet::before  { background: var(--violet); }
+
+    .card--emerald:hover { border-color: var(--emerald-mid); }
+    .card--sky:hover     { border-color: var(--sky-mid); }
+    .card--amber:hover   { border-color: var(--amber-mid); }
+    .card--violet:hover  { border-color: var(--violet-mid); }
+
+    .card .card-label {
+      font-size: 10.5px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .12em; margin-bottom: 10px; display: block;
+    }
+    .card .card-title {
+      font-size: 18px; font-weight: 700; margin-bottom: 8px; color: var(--ink);
+      line-height: 1.2;
+    }
+    .card .card-desc {
+      font-size: 14px; color: var(--muted); line-height: 1.5;
+    }
+
+    /* ═══════════════════════════════════════════
+       PIPELINE (colored step flow)
+       ═══════════════════════════════════════════ */
+    .pipeline {
+      display: flex; align-items: stretch; gap: 0;
+      width: 100%; max-width: 1080px; margin-top: 28px;
+    }
+    .pipe-step {
+      flex: 1; text-align: center; padding: 20px 12px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius);
+      opacity: 0; transform: translateY(14px);
+      animation: fadeUp .5s forwards;
+    }
+    .pipe-arrow {
+      display: flex; align-items: center; padding: 0 6px;
+      font-size: 17px; font-weight: 300;
+      opacity: 0; animation: fadeUp .4s forwards;
+    }
+
+    /* Stagger animations */
+    .active .pipe-step:nth-child(1)  { animation-delay: .06s; }
+    .active .pipe-arrow:nth-child(2) { animation-delay: .12s; }
+    .active .pipe-step:nth-child(3)  { animation-delay: .18s; }
+    .active .pipe-arrow:nth-child(4) { animation-delay: .24s; }
+    .active .pipe-step:nth-child(5)  { animation-delay: .30s; }
+    .active .pipe-arrow:nth-child(6) { animation-delay: .36s; }
+    .active .pipe-step:nth-child(7)  { animation-delay: .42s; }
+    .active .pipe-arrow:nth-child(8) { animation-delay: .48s; }
+    .active .pipe-step:nth-child(9)  { animation-delay: .54s; }
+    .active .pipe-arrow:nth-child(10){ animation-delay: .60s; }
+    .active .pipe-step:nth-child(11) { animation-delay: .66s; }
+
+    .step-num {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 30px; height: 30px; border-radius: 50%;
+      font-size: 13px; font-weight: 800; margin-bottom: 8px;
+      color: var(--bg);
+    }
+    .step-label { font-size: 13px; font-weight: 700; color: var(--ink); margin-bottom: 3px; }
+    .step-desc  { font-size: 11px; color: var(--muted); line-height: 1.35; }
+
+    /* ═══════════════════════════════════════════
+       SPLIT LAYOUT (text + image)
+       ═══════════════════════════════════════════ */
+    .split {
+      display: grid; grid-template-columns: 1fr 1.1fr;
+      gap: 44px; width: 100%; max-width: 1060px; align-items: center;
+    }
+    .text-side { text-align: left; }
+
+    .image-box {
+      border-radius: var(--radius); overflow: hidden;
+      border: 1px solid var(--border); background: var(--bg-card);
+      box-shadow:
+        0 2px 8px rgba(0,0,0,.2),
+        0 20px 60px rgba(0,0,0,.35);
+    }
+    .image-box img { width: 100%; display: block; }
+
+    /* ═══════════════════════════════════════════
+       BULLET LIST (color-coded dots)
+       ═══════════════════════════════════════════ */
+    .bullets { display: grid; gap: 14px; margin-top: 18px; text-align: left; }
+    .bl-item {
+      display: flex; align-items: flex-start; gap: 12px;
+      font-size: 16px; color: var(--muted); line-height: 1.45;
+    }
+    .bl-item strong { color: var(--ink); font-weight: 600; }
+    .bl-dot {
+      width: 9px; height: 9px; margin-top: 7px;
+      border-radius: 50%; flex-shrink: 0;
+    }
+    .bl-dot--emerald { background: var(--emerald); box-shadow: 0 0 10px var(--emerald-mid); }
+    .bl-dot--sky     { background: var(--sky);     box-shadow: 0 0 10px var(--sky-mid); }
+    .bl-dot--amber   { background: var(--amber);   box-shadow: 0 0 10px var(--amber-mid); }
+    .bl-dot--violet  { background: var(--violet);  box-shadow: 0 0 10px var(--violet-mid); }
+
+    /* ═══════════════════════════════════════════
+       METRICS ROW
+       ═══════════════════════════════════════════ */
+    .metric-strip {
+      display: grid; grid-template-columns: repeat(4, 1fr);
+      gap: 14px; width: 100%; max-width: 700px; margin-top: 22px;
+    }
+    .metric {
+      padding: 14px 16px; text-align: left;
+      border-radius: 0 var(--radius) var(--radius) 0;
+      background: var(--bg-card); border-left: 3px solid;
+    }
+    .metric .val { font-size: 22px; font-weight: 800; display: block; color: var(--ink); }
+    .metric .lbl { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+    /* ═══════════════════════════════════════════
+       SLIDE FOOTER & NAV
+       ═══════════════════════════════════════════ */
+    .slide-footer {
+      position: absolute; bottom: 20px; left: 72px; right: 72px;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 11.5px; color: var(--faint);
+      border-top: 1px solid var(--border); padding-top: 12px;
+    }
+
+    .controls {
+      position: fixed; bottom: 18px; right: 22px; z-index: 10;
+      display: flex; gap: 5px;
+    }
+    .controls button {
+      width: 36px; height: 36px; border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--glass); backdrop-filter: blur(12px);
+      color: var(--ink); font-size: 14px; cursor: pointer;
+      display: grid; place-items: center;
+      transition: border-color .25s, transform .2s;
+    }
+    .controls button:hover { border-color: var(--emerald); transform: scale(1.08); }
+
+    /* Progress bar — gradient through all accents */
+    .progress-bar {
+      position: fixed; top: 0; left: 0; height: 3px; z-index: 20;
+      background: linear-gradient(90deg, var(--emerald), var(--sky), var(--amber), var(--violet));
+      background-size: 300% 100%;
+      transition: width .4s cubic-bezier(.4,0,.2,1);
+      box-shadow: 0 0 14px rgba(52,211,153,.25);
+    }
+
+    /* ═══════════════════════════════════════════
+       ANIMATIONS
+       ═══════════════════════════════════════════ */
+    @keyframes fadeUp { to { opacity: 1; transform: translateY(0); } }
+
+    /* ═══════════════════════════════════════════
+       RESPONSIVE
+       ═══════════════════════════════════════════ */
+    @media (max-width: 960px) {
+      .slide { padding: 30px 24px 28px; }
+      .split { grid-template-columns: 1fr; gap: 24px; }
+      .grid.c3, .grid.c4 { grid-template-columns: 1fr 1fr; }
+      .pipeline { flex-direction: column; gap: 4px; }
+      .pipe-arrow { transform: rotate(90deg); justify-content: center; padding: 4px; }
+      .metric-strip { grid-template-columns: 1fr 1fr; }
+      .slide-footer { left: 24px; right: 24px; }
+      h1 { font-size: 34px; }
+      h2 { font-size: 26px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress-bar" id="progress"></div>
+
+  <main class="deck" id="deck">
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 1 — THE HOOK (10-15 seconds)
+         "State what your project does in one sentence"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide active">
+      <span class="tag tag--emerald">MoPR Hackathon PS2 · IIT Tirupati · Final Round</span>
+      <h1>We turn <span class="hl-emerald">drone surveys</span> into <span class="hl-sky">drainage plans</span> for rural villages</h1>
+      <p class="subtitle">
+        Our AI pipeline takes a raw
+        <span class="term term--emerald">point cloud<span class="tip">Millions of 3D coordinates captured by a drone's laser sensor</span></span>
+        and automatically produces terrain models, water-flow maps, flood-risk zones, and
+        <span class="term term--sky">GIS-ready<span class="tip">Geographic Information System — standard map formats planners already use</span></span>
+        drainage designs — <strong>zero manual steps</strong>.
+      </p>
+      <div class="slide-footer">
+        <span>Geo-Intel DTM Pipeline</span>
+        <span>← →  or  Space  ·  hover dotted terms for definitions</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 2 — THE PROBLEM (30-40 seconds)
+         "Use a real-world scenario to illustrate the pain"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide">
+      <span class="tag tag--amber">The Problem</span>
+      <h2>Every monsoon, villages flood — because <span class="hl-amber">no one can see</span> how water actually moves through the terrain</h2>
+      <p class="subtitle">
+        Government drone surveys now produce rich 3D data as
+        <span class="term term--emerald">LAS/LAZ files<span class="tip">Standard formats storing millions of 3D laser-scan points</span></span>.
+        But these files are massive and highly technical. Planners can't use them directly — so the data sits unused while villages keep flooding.
+      </p>
+      <div class="grid c4" style="margin-top:28px;">
+        <div class="card card--emerald">
+          <span class="card-label hl-emerald">Step 1 — Input</span>
+          <div class="card-title">Point Cloud</div>
+          <div class="card-desc">Millions of 3D laser points from a drone flying over the village. <em class="explain">Think of it as a dense cloud of dots representing every surface.</em></div>
+        </div>
+        <div class="card card--violet">
+          <span class="card-label hl-violet">Step 2 — Need</span>
+          <div class="card-title">DTM</div>
+          <div class="card-desc"><strong>Digital Terrain Model</strong> — a clean map of just the bare ground, with buildings and trees removed. <em class="explain">Like peeling off everything to see the earth underneath.</em></div>
+        </div>
+        <div class="card card--sky">
+          <span class="card-label hl-sky">Step 3 — Insight</span>
+          <div class="card-title">Hydrology</div>
+          <div class="card-desc">Understanding <em>where rainwater flows, pools, and creates problems</em> — computed from terrain shape. <em class="explain">The science of water movement.</em></div>
+        </div>
+        <div class="card card--amber">
+          <span class="card-label hl-amber">Step 4 — Action</span>
+          <div class="card-title">Drainage Design</div>
+          <div class="card-desc">Map-ready drainage lines that engineers can review and <strong>build on the ground</strong>. <em class="explain">The actionable output.</em></div>
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>PS2 Scope: DTM · flow paths · waterlogging · optimized drainage</span>
+        <span>02</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 3 — THE SOLUTION (pipeline)
+         "Show how it works — focus on purpose, not just mechanics"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide">
+      <span class="tag tag--violet">Our Solution</span>
+      <h2>A fully automated pipeline — from <span class="hl-emerald">raw LiDAR</span> to <span class="hl-sky">drainage design</span></h2>
+      <p class="subtitle">
+        <span class="term term--emerald">LiDAR<span class="tip">Light Detection and Ranging — a laser method drones use to scan terrain elevation</span></span>
+        data flows through six automated stages. Each color represents a different domain.
+      </p>
+      <div class="pipeline">
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--emerald)">1</div>
+          <div class="step-label">Load <span class="hl-emerald">LAS</span></div>
+          <div class="step-desc">Read millions of points in memory-safe chunks</div>
+        </div>
+        <span class="pipe-arrow hl-emerald">→</span>
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--violet)">2</div>
+          <div class="step-label">AI Classify</div>
+          <div class="step-desc"><span class="term term--violet" style="font-size:inherit;border:0;">Random Forest<span class="tip">An AI model using many decision trees to label each point as ground or non-ground</span></span> separates ground from buildings/trees</div>
+        </div>
+        <span class="pipe-arrow hl-violet">→</span>
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--emerald)">3</div>
+          <div class="step-label">Build <span class="hl-emerald">DTM</span></div>
+          <div class="step-desc">Interpolate ground into a <span class="term term--emerald" style="font-size:inherit;border:0;">GeoTIFF<span class="tip">A standard geo-referenced image for elevation — readable by any mapping software</span></span> terrain</div>
+        </div>
+        <span class="pipe-arrow hl-sky">→</span>
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--sky)">4</div>
+          <div class="step-label">Model <span class="hl-sky">Flow</span></div>
+          <div class="step-desc">Compute <span class="term term--sky" style="font-size:inherit;border:0;">flow accumulation<span class="tip">How much upstream water collects at each point — higher value = more runoff passing through</span></span> and catchments</div>
+        </div>
+        <span class="pipe-arrow hl-amber">→</span>
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--amber)">5</div>
+          <div class="step-label">Detect <span class="hl-amber">Risk</span></div>
+          <div class="step-desc">Sink depth, <span class="term term--amber" style="font-size:inherit;border:0;">TWI<span class="tip">Topographic Wetness Index — identifies naturally wet, flood-prone areas from terrain shape</span></span>, flood vulnerability zones</div>
+        </div>
+        <span class="pipe-arrow hl-sky">→</span>
+        <div class="pipe-step">
+          <div class="step-num" style="background:var(--sky)">6</div>
+          <div class="step-label">Design <span class="hl-sky">Drains</span></div>
+          <div class="step-desc">Streams → drainage vectors with engineering dimensions</div>
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>Python · laspy · scikit-learn · rasterio · GeoPandas · WhiteboxTools</span>
+        <span>03</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 4 — LAYER STACK
+         "We don't output one map — we create decision layers"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide">
+      <span class="tag tag--sky">What We Produce</span>
+      <h2>Not one map — a <span class="hl-sky">stack of decision layers</span></h2>
+      <p class="subtitle">Each layer answers a different planning question. Together they give the full drainage picture.</p>
+      <div class="grid c4" style="margin-top:26px;">
+        <div class="card card--emerald" style="text-align:center;">
+          <span class="card-label hl-emerald">Layer 1</span>
+          <div class="card-title"><span class="hl-emerald">DTM</span></div>
+          <div class="card-desc">The bare-earth elevation surface. <em class="explain">What the ground actually looks like — without buildings or trees.</em></div>
+        </div>
+        <div class="card card--sky" style="text-align:center;">
+          <span class="card-label hl-sky">Layer 2</span>
+          <div class="card-title"><span class="hl-sky">Flow Accumulation</span></div>
+          <div class="card-desc">Where rainwater concentrates into streams. <em class="explain">The natural drainage highways across the terrain.</em></div>
+        </div>
+        <div class="card card--amber" style="text-align:center;">
+          <span class="card-label hl-amber">Layer 3</span>
+          <div class="card-title"><span class="hl-amber">Waterlogging Hotspots</span></div>
+          <div class="card-desc">Low-lying sinks and high-wetness areas. <em class="explain">Where flooding will likely happen first.</em></div>
+        </div>
+        <div class="card card--violet" style="text-align:center;">
+          <span class="card-label hl-violet">Layer 4</span>
+          <div class="card-title"><span class="hl-violet">Drainage Network</span></div>
+          <div class="card-desc">Optimized drain alignments. <em class="explain">Where to actually build the drainage channels.</em></div>
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>Each layer is a separate GIS file — planners inspect them independently</span>
+        <span>04</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 5 — OUTPUT EVIDENCE (the "demo")
+         "Show real results, not just theory"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide left">
+      <span class="tag tag--emerald">Real Output</span>
+      <div class="split">
+        <div class="text-side">
+          <h2>One village — <span class="hl-emerald">four linked views</span></h2>
+          <p class="subtitle" style="max-width:460px;">
+            The same terrain viewed as elevation, water flow, flood risk, and drainage — making
+            <span class="term term--sky">hydrology<span class="tip">The science of water movement through the landscape</span></span>
+            understandable even for non-technical planners.
+          </p>
+          <div class="metric-strip">
+            <div class="metric" style="border-color:var(--emerald)"><span class="val">2 m</span><span class="lbl">DTM grid resolution</span></div>
+            <div class="metric" style="border-color:var(--violet)"><span class="val">1M</span><span class="lbl">Points per chunk</span></div>
+            <div class="metric" style="border-color:var(--violet)"><span class="val">RF</span><span class="lbl">Random Forest model</span></div>
+            <div class="metric" style="border-color:var(--sky)"><span class="val">GIS</span><span class="lbl">GeoTIFF · GPKG · SHP</span></div>
+          </div>
+        </div>
+        <div class="image-box">
+          <img src="../outputs/jobs/6967b254/devdi_ortho_Summary.png" alt="DTM, flow, waterlogging, and drainage summary" />
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>Generated from outputs/jobs/6967b254</span>
+        <span>05</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 6 — HYDROLOGY DEEP DIVE
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide left">
+      <span class="tag tag--sky">Hydrology Analysis</span>
+      <div class="split">
+        <div class="image-box">
+          <img src="../outputs/jobs/6967b254/devdi_HydrologySummary.png" alt="Hydrology summary" />
+        </div>
+        <div class="text-side">
+          <h2>Understanding <span class="hl-sky">how water behaves</span></h2>
+          <div class="bullets">
+            <div class="bl-item">
+              <span class="bl-dot bl-dot--sky"></span>
+              <span><strong>Flow accumulation</strong> — traces where runoff naturally concentrates into streams. <em class="explain">The more upstream area drains through a point, the higher its accumulation.</em></span>
+            </div>
+            <div class="bl-item">
+              <span class="bl-dot bl-dot--sky"></span>
+              <span><strong>Stream extraction</strong> — pulls candidate drain alignments from flow data. <em class="explain">These are lines where water already wants to go.</em></span>
+            </div>
+            <div class="bl-item">
+              <span class="bl-dot bl-dot--emerald"></span>
+              <span><strong>Catchments</strong> — splits the village into manageable drainage zones. <em class="explain">Like dividing land into natural "buckets" that each drain to one point.</em></span>
+            </div>
+            <div class="bl-item">
+              <span class="bl-dot bl-dot--amber"></span>
+              <span><strong>Flood vulnerability</strong> — ranks areas by how likely they are to waterlog. <em class="explain">Combines sink depth, wetness index, and low elevation to score risk.</em></span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>WhiteboxTools hydrological modelling</span>
+        <span>06</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 7 — DELIVERABLES
+         "What we actually submit to evaluators"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide">
+      <span class="tag tag--violet">Deliverables</span>
+      <h2>Everything <span class="hl-violet">PS2 evaluators</span> asked for — in one automated pipeline</h2>
+      <div class="grid c3" style="margin-top:26px;">
+        <div class="card card--violet">
+          <span class="card-label hl-violet">AI / ML Processing</span>
+          <div class="card-title">Point Cloud → DTM</div>
+          <div class="card-desc">
+            Automated ground classification using
+            <span class="term term--violet">Random Forest<span class="tip">A machine-learning model built from hundreds of decision trees for classification</span></span>,
+            CRS handling, interpolation, and raster export. <em class="explain">No manual labeling or editing needed.</em>
+          </div>
+        </div>
+        <div class="card card--sky">
+          <span class="card-label hl-sky">Optimized Drainage</span>
+          <div class="card-title">Design-ready vectors</div>
+          <div class="card-desc">
+            Flow paths, catchments, hotspots, and drainage design parameters — all as
+            <span class="term term--sky">GeoPackage<span class="tip">A modern, portable database format for storing multiple map layers in a single file</span></span>
+            layers. <em class="explain">Open in QGIS and immediately inspect.</em>
+          </div>
+        </div>
+        <div class="card card--emerald">
+          <span class="card-label hl-emerald">Deployment</span>
+          <div class="card-title">Repeatable for any village</div>
+          <div class="card-desc">
+            CLI and web interface. Standard GeoTIFF/GPKG/SHP outputs.
+            <em class="explain">Give it a new village's drone data — it runs the same pipeline automatically.</em>
+          </div>
+        </div>
+      </div>
+      <p class="subtitle" style="margin-top:22px; max-width:800px;">
+        <strong>Core outputs:</strong> DTM · flow direction · flow accumulation · TWI · catchments · waterlogging hotspots · drainage network · final GeoPackage
+      </p>
+      <div class="slide-footer">
+        <span>Aligned with MoPR PS2 expected deliverables</span>
+        <span>07</span>
+      </div>
+    </section>
+
+    <!-- ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+         SLIDE 8 — CLOSING / IMPACT
+         "Scalability and long-term vision"
+         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ -->
+    <section class="slide">
+      <span class="tag tag--emerald">Impact</span>
+      <h1>From drone flight to <span class="hl-sky">resilient drainage</span> decisions</h1>
+      <p class="subtitle">
+        A scalable geospatial intelligence pipeline that <strong>reduces weeks of manual terrain processing to minutes</strong> — and gives planners a map stack they can inspect, validate, and build from.
+      </p>
+      <div class="grid c4" style="margin-top:28px; max-width:860px;">
+        <div class="card card--emerald" style="text-align:center;">
+          <div class="card-title" style="font-size:20px;"><span class="hl-emerald">Scalable</span></div>
+          <div class="card-desc">Chunked processing handles large villages without running out of memory</div>
+        </div>
+        <div class="card card--sky" style="text-align:center;">
+          <div class="card-title" style="font-size:20px;"><span class="hl-sky">Explainable</span></div>
+          <div class="card-desc">Every decision is backed by a visible, inspectable terrain layer</div>
+        </div>
+        <div class="card card--violet" style="text-align:center;">
+          <div class="card-title" style="font-size:20px;"><span class="hl-violet">Interoperable</span></div>
+          <div class="card-desc">Standard GeoTIFF & GeoPackage formats for QGIS and any GIS tool</div>
+        </div>
+        <div class="card card--amber" style="text-align:center;">
+          <div class="card-title" style="font-size:20px;"><span class="hl-amber">Actionable</span></div>
+          <div class="card-desc">Model output transforms into real drainage engineering parameters</div>
+        </div>
+      </div>
+      <div class="slide-footer">
+        <span>Thank you · Geo-Intel DTM Pipeline</span>
+        <span>08</span>
+      </div>
+    </section>
+
+  </main>
+
+  <div class="controls">
+    <button type="button" id="prev" aria-label="Previous slide">←</button>
+    <button type="button" id="next" aria-label="Next slide">→</button>
+  </div>
+
+  <script>
+    const slides = [...document.querySelectorAll('.slide')];
+    const bar = document.getElementById('progress');
+    let idx = 0;
+
+    function go(next) {
+      slides[idx].classList.remove('active');
+      idx = (next + slides.length) % slides.length;
+      slides[idx].classList.add('active');
+      bar.style.width = ((idx + 1) / slides.length * 100) + '%';
+    }
+
+    // Initial progress
+    bar.style.width = (1 / slides.length * 100) + '%';
+
+    document.getElementById('next').addEventListener('click', () => go(idx + 1));
+    document.getElementById('prev').addEventListener('click', () => go(idx - 1));
+
+    window.addEventListener('keydown', (e) => {
+      if (['ArrowRight', ' ', 'PageDown'].includes(e.key)) { e.preventDefault(); go(idx + 1); }
+      if (['ArrowLeft', 'PageUp'].includes(e.key))          { e.preventDefault(); go(idx - 1); }
+      if (e.key === 'Home') go(0);
+      if (e.key === 'End')  go(slides.length - 1);
+    });
+  </script>
+</body>
+</html>

@@ -2,12 +2,15 @@
 const BASE_URL = import.meta.env.VITE_API_URL;
 
 export const api = {
-    upload: async (file, villageName, epsgCode) => {
+    upload: async (file, villageName, epsgCode, streamThreshold) => {
         const formData = new FormData();
         formData.append("file", file);
         formData.append("village_name", villageName);
         if (epsgCode) {
             formData.append("epsg_code", epsgCode);
+        }
+        if (streamThreshold !== undefined && streamThreshold !== null) {
+            formData.append("stream_threshold", streamThreshold);
         }
         const res = await fetch(`${BASE_URL}/upload`, { method: "POST", body: formData });
         if (!res.ok) {
@@ -26,6 +29,17 @@ export const api = {
         return res.json();
     },
 
+    rerunHydrology: async (jobId, streamThreshold) => {
+        const formData = new FormData();
+        formData.append("stream_threshold", streamThreshold);
+        const res = await fetch(`${BASE_URL}/rerun-hydrology/${jobId}`, { method: "POST", body: formData });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new Error(err.detail || "Re-run failed");
+        }
+        return res.json();
+    },
+
     getStatus: async (jobId) => {
         const res = await fetch(`${BASE_URL}/status/${jobId}`);
         if (!res.ok) throw new Error("Job not found");
@@ -35,6 +49,12 @@ export const api = {
     getFiles: async (jobId) => {
         const res = await fetch(`${BASE_URL}/files/${jobId}`);
         if (!res.ok) throw new Error("Could not load files");
+        return res.json();
+    },
+
+    getGeoJSON: async (jobId) => {
+        const res = await fetch(`${BASE_URL}/geojson/${jobId}`);
+        if (!res.ok) throw new Error("DrainageDesign GeoJSON not available yet");
         return res.json();
     },
 
@@ -50,3 +70,4 @@ export const api = {
         return res.json();
     }
 };
+

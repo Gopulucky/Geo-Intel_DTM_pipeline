@@ -55,6 +55,10 @@ import laspy
 from tqdm import tqdm
 import joblib
 import whitebox
+try:
+    import requests
+except ImportError:
+    requests = None
 
 warnings.filterwarnings("ignore")
 
@@ -861,13 +865,136 @@ def _raster_to_polygons(mask: np.ndarray, reference_tif: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MODULE 5b – DYNAMIC RAINFALL & THRESHOLD FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_dtm_center_latlon(dtm_path: str) -> tuple:
+    """
+    Reads a projected DTM GeoTIFF, computes its bounding-box centre,
+    and reprojects that point to geographic coordinates (EPSG:4326).
+
+    Returns:
+        (lat, lon) as floats, or (None, None) on failure.
+    """
+    try:
+        from pyproj import Transformer
+        with rasterio.open(dtm_path) as src:
+            bounds = src.bounds
+            src_crs = src.crs
+
+        cx = (bounds.left + bounds.right) / 2.0
+        cy = (bounds.bottom + bounds.top) / 2.0
+
+        # If the CRS is already geographic, no transform needed
+        if src_crs and src_crs.is_geographic:
+            return cy, cx   # lat, lon
+
+        # Reproject from projected CRS -> WGS-84
+        transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
+        lon, lat = transformer.transform(cx, cy)
+        print(f"  [Rainfall] DTM centre -> Lat: {lat:.5f}, Lon: {lon:.5f}")
+        return float(lat), float(lon)
+    except Exception as e:
+        print(f"  [Rainfall] WARNING: Could not extract DTM lat/lon: {e}")
+        return None, None
+
+
+def fetch_peak_rainfall(lat: float, lon: float,
+                        default_mm_day: float = 100.0) -> float:
+    """
+    Fetches the last 10 years of daily precipitation from the Open-Meteo
+    Historical Weather API (a free proxy for regional gridded datasets such
+    as ERA5 / IMD-merged products) and returns the 99th-percentile daily
+    rainfall as the design storm value P_day (mm/day).
+
+    Falls back to `default_mm_day` if the API is unreachable or lat/lon
+    are not available.
+    """
+    if lat is None or lon is None:
+        print(f"  [Rainfall] No coordinates available – using default {default_mm_day} mm/day")
+        return default_mm_day
+
+    if requests is None:
+        print("  [Rainfall] 'requests' library not installed – using default rainfall.")
+        return default_mm_day
+
+    from datetime import date, timedelta
+    end_date   = date.today()
+    start_date = end_date.replace(year=end_date.year - 10)
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude":            lat,
+        "longitude":           lon,
+        "start_date":          start_date.isoformat(),
+        "end_date":            end_date.isoformat(),
+        "daily":               "precipitation_sum",
+        "timezone":            "Asia/Kolkata",
+    }
+
+    try:
+        print(f"  [Rainfall] Fetching 10-year precipitation data from Open-Meteo...")
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        precip = np.array(data["daily"]["precipitation_sum"], dtype=float)
+        # Remove NaN / fill-values
+        precip = precip[~np.isnan(precip)]
+
+        if len(precip) == 0:
+            raise ValueError("Empty precipitation array returned by API.")
+
+        p99 = float(np.percentile(precip, 99))
+        print(f"  [Rainfall] 10-year P99 daily rainfall = {p99:.1f} mm/day  "
+              f"(n={len(precip)} days, max={precip.max():.1f} mm)")
+        return p99
+
+    except Exception as e:
+        print(f"  [Rainfall] API error ({e}) – falling back to {default_mm_day} mm/day")
+        return default_mm_day
+
+
+def calculate_dynamic_threshold(rainfall_mm_day: float,
+                                cell_resolution_m: float = 2.0) -> int:
+    """
+    Derives the stream-extraction flow-accumulation threshold from a
+    critical-discharge / rational-method formulation:
+
+        Threshold_Cells = (Q_c * 86_400_000) / (C * P_day * cell_area)
+
+    where
+        Q_c       = 0.01  m^3/s  – critical discharge for channel initiation
+        C         = 0.60         – runoff coefficient (rural)
+        P_day               mm/day – peak daily rainfall (99th percentile)
+        cell_area = res^2   m^2   – DTM pixel area
+
+    Returns an integer >= 10 (never lets the threshold drop below 10 cells).
+    """
+    Q_c       = 0.01          # m^3/s
+    C         = 0.60          # runoff coefficient
+    cell_area = cell_resolution_m ** 2   # m^2
+
+    # Guard against zero / nonsensical rainfall
+    rainfall_safe = max(rainfall_mm_day, 1.0)
+
+    threshold_cells = (Q_c * 86_400_000.0) / (C * rainfall_safe * cell_area)
+    threshold_cells = max(10, int(threshold_cells))
+
+    print(f"  [Threshold] Dynamic stream threshold = {threshold_cells} cells  "
+          f"(P_day={rainfall_safe:.1f} mm, res={cell_resolution_m} m)")
+    return threshold_cells
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MODULE 6 – DRAINAGE NETWORK DESIGN PARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_drainage_parameters(streams_path: str,
                                  dtm_path: str,
                                  facc_path: str,
-                                 village_name: str) -> gpd.GeoDataFrame:
+                                 village_name: str,
+                                 rainfall_mm_day: float = 100.0) -> gpd.GeoDataFrame:
     """
     Augment the stream network with engineering design parameters:
       - Strahler stream order
@@ -875,6 +1002,10 @@ def compute_drainage_parameters(streams_path: str,
       - Catchment area proxy (from flow accumulation)
       - Recommended channel width & depth (rational method proxy)
       - Flow velocity estimate (Manning's equation)
+
+    Args:
+        rainfall_mm_day: Design storm (P99 99th-percentile daily rainfall in mm/day).
+                         Replaces the legacy hardcoded 50 mm/hr assumption.
     """
     if not os.path.exists(streams_path):
         print("  No stream file found; skipping parameter computation.")
@@ -931,10 +1062,12 @@ def compute_drainage_parameters(streams_path: str,
     gdf["slope_m_m"] = np.clip(slopes, 0.001, 1.0)
 
     # ── Rational Method proxy for channel sizing ──────────────────────────────
-    # Q = C * i * A  (simplified; C=0.6 for rural, i=50mm/hr design rain)
-    C_runoff   = 0.6
-    i_mm_hr    = 50.0
-    i_m_s      = i_mm_hr / (1000.0 * 3600.0)
+    # Q = C * i * A  (C=0.6 rural; i derived from dynamic daily rainfall P99)
+    # Convert mm/day -> m/s:  (mm/day) / 1000 / 86400
+    C_runoff = 0.6
+    i_m_s    = (rainfall_mm_day / 1000.0) / 86400.0
+    print(f"  [Drainage] Using design rainfall: {rainfall_mm_day:.1f} mm/day  "
+          f"→ i = {i_m_s*1e6:.3f} µm/s  ({i_m_s*1000*3600:.2f} mm/hr equiv)")
 
     # ── Catchment area from Flow Accumulation ────────────────────────────────
     res = 2.0  # fallback resolution
@@ -989,12 +1122,55 @@ def compute_drainage_parameters(streams_path: str,
         dtm_crs = _src.crs
     if dtm_crs is not None:
         gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
-        
+
+    # ── Save GeoPackage (primary engineering format) ──────────────────────────
     out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg")
     gdf.to_file(out_path, driver="GPKG")
     print(f"  Drainage design parameters saved -> {out_path}")
     print(gdf[["strahler_ord","slope_m_m","peak_flow_m3s",
                "channel_width_m","channel_depth_m","velocity_m_s"]].describe().round(3))
+
+    # ── Step 6: Export clean GeoJSON for frontend attribute panel ─────────────
+    # Reproject to WGS-84 (EPSG:4326) so Leaflet/Mapbox can render it natively.
+    # Cast all hydraulic columns to clean Python float/int so JSON serialisation
+    # never produces NaN, Infinity, or Pandas NA values that break the browser.
+    try:
+        gdf_wgs = gdf.to_crs("EPSG:4326") if (gdf.crs is not None) else gdf.copy()
+    except Exception:
+        gdf_wgs = gdf.copy()
+
+    HYDRAULIC_COLS = [
+        "id", "type", "strahler_ord",
+        "length_m", "slope_m_m",
+        "catchment_area_m2", "peak_flow_m3s",
+        "channel_width_m", "channel_depth_m", "velocity_m_s",
+    ]
+
+    # Tag every feature with the design-storm rainfall used
+    gdf_wgs["rainfall_mm_day"] = float(rainfall_mm_day)
+
+    # Coerce each column to a clean scalar type; fill bad values with sentinel
+    for col in HYDRAULIC_COLS:
+        if col not in gdf_wgs.columns:
+            continue
+        if col in ("id", "strahler_ord"):
+            gdf_wgs[col] = (
+                pd.to_numeric(gdf_wgs[col], errors="coerce")
+                  .fillna(0).astype(int)
+            )
+        else:
+            gdf_wgs[col] = (
+                pd.to_numeric(gdf_wgs[col], errors="coerce")
+                  .fillna(0.0)
+                  .round(4)
+                  .astype(float)
+            )
+
+    geojson_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson")
+    gdf_wgs[["geometry", "rainfall_mm_day"] + [c for c in HYDRAULIC_COLS if c in gdf_wgs.columns]].to_file(
+        geojson_path, driver="GeoJSON"
+    )
+    print(f"  Frontend GeoJSON saved -> {geojson_path}")
     return gdf
 
 
@@ -1160,15 +1336,31 @@ def run_pipeline_for_village(las_path: str, village_name: str,
     print("\n[Step 4] DTM Generation...")
     dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
 
-    # 5. Hydrology
-    print("\n[Step 5] Hydrological Analysis...")
-    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=CONFIG.get("_village_flow_threshold"))
+    # 4b. Get DTM geographic centre for weather API
+    print("\n[Step 4b] Extracting DTM geographic coordinates...")
+    lat, lon = get_dtm_center_latlon(dtm_path)
 
-    # 6. Drainage design parameters
+    # 4c. Fetch historical peak rainfall (P99)
+    print("\n[Step 4c] Fetching historical peak rainfall from Open-Meteo...")
+    peak_rainfall_mm_day = fetch_peak_rainfall(lat, lon)
+
+    # 4d. Calculate dynamic stream-extraction threshold
+    print("\n[Step 4d] Calculating dynamic stream extraction threshold...")
+    cell_res = CONFIG.get("dtm_resolution", 2.0)
+    dynamic_threshold = calculate_dynamic_threshold(peak_rainfall_mm_day, cell_res)
+
+    # 5. Hydrology (with dynamic threshold)
+    print("\n[Step 5] Hydrological Analysis...")
+    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=dynamic_threshold)
+
+    # 6. Drainage design parameters (with dynamic rainfall)
     print("\n[Step 6] Drainage Design Parameters...")
     streams_path = hydro_paths.get("streams", "")
     facc_path    = hydro_paths.get("FlowAccumulation", "")
-    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
+    drain_gdf = compute_drainage_parameters(
+        streams_path, dtm_path, facc_path, village_name,
+        rainfall_mm_day=peak_rainfall_mm_day
+    )
 
     # 7. Visualise
     print("\n[Step 7] Generating summary figure...")
@@ -1225,15 +1417,31 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
     gc.collect()
     print("  Freed point cloud from memory.")
 
-    # 3. Hydrology
-    print("\n[Step 3] Hydrological Analysis...")
-    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=CONFIG.get("_village_flow_threshold"))
+    # 2b. Get DTM geographic centre for weather API
+    print("\n[Step 2b] Extracting DTM geographic coordinates...")
+    lat, lon = get_dtm_center_latlon(dtm_path)
 
-    # 4. Drainage design parameters
+    # 2c. Fetch historical peak rainfall (P99)
+    print("\n[Step 2c] Fetching historical peak rainfall from Open-Meteo...")
+    peak_rainfall_mm_day = fetch_peak_rainfall(lat, lon)
+
+    # 2d. Calculate dynamic stream-extraction threshold
+    print("\n[Step 2d] Calculating dynamic stream extraction threshold...")
+    cell_res = CONFIG.get("dtm_resolution", 2.0)
+    dynamic_threshold = calculate_dynamic_threshold(peak_rainfall_mm_day, cell_res)
+
+    # 3. Hydrology (with dynamic threshold)
+    print("\n[Step 3] Hydrological Analysis...")
+    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=dynamic_threshold)
+
+    # 4. Drainage design parameters (with dynamic rainfall)
     print("\n[Step 4] Drainage Design Parameters...")
     streams_path = hydro_paths.get("streams", "")
     facc_path    = hydro_paths.get("FlowAccumulation", "")
-    drain_gdf = compute_drainage_parameters(streams_path, dtm_path, facc_path, village_name)
+    drain_gdf = compute_drainage_parameters(
+        streams_path, dtm_path, facc_path, village_name,
+        rainfall_mm_day=peak_rainfall_mm_day
+    )
 
     # 5. Visualise
     print("\n[Step 5] Generating summary figure...")
@@ -1310,10 +1518,9 @@ if __name__ == "__main__":
             CONFIG["output_dir"] = os.path.abspath(os.path.join(os.path.dirname(__file__), "outputs"))
             os.makedirs(CONFIG["output_dir"], exist_ok=True)
             
-            # Default thresholds for dynamic execution
-            CONFIG["_village_flow_threshold"] = 500
+            # EPSG hint for dynamic execution (dynamic threshold is now computed inside the pipeline)
             CONFIG["epsg"] = 32643
-            
+
             run_pipeline_memory_efficient(las_path, target_name)
         else:
             print(f"Skipping - LAS file not found at {las_path}")

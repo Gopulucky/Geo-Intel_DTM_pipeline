@@ -119,7 +119,8 @@ async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     village_name: str = Form(...),
-    epsg_code: str = Form(None)
+    epsg_code: str = Form(None),
+    stream_threshold: int = Form(None)
 ):
     """
     Receives .las/.laz file and village name.
@@ -168,13 +169,15 @@ async def upload_file(
     }
     persist_job(job_id)
 
+    # Enqueue pipeline task
     background_tasks.add_task(
         run_full_pipeline,
         job_id=job_id,
         las_path=las_path,
         village_name=village_name,
         output_dir=output_dir,
-        epsg_code=epsg_code
+        epsg_code=epsg_code,
+        stream_threshold=stream_threshold
     )
 
     return {
@@ -230,7 +233,30 @@ async def run_demo(background_tasks: BackgroundTasks, village_name: str = "DEMO_
     return {"job_id": job_id, "demo": True, "village": village_name}
 
 
-# ── Status & Files ────────────────────────────────────────────────────────────
+@app.post("/rerun-hydrology/{job_id}")
+async def rerun_hydrology(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    stream_threshold: int = Form(...)
+):
+    """
+    Re-runs the Hydrology and Map stages with a new physics threshold.
+    """
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    from pipeline_runner import re_run_hydrology_stages
+    
+    background_tasks.add_task(
+        re_run_hydrology_stages,
+        job_id=job_id,
+        stream_threshold=stream_threshold
+    )
+    
+    return {"status": "re_running_hydrology", "job_id": job_id}
+
+
+# ── Status Polling ────────────────────────────────────────────────────────────
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
@@ -266,6 +292,32 @@ def list_files(job_id: str):
                 "url": f"/download/{job_id}/{fname}"
             })
     return {"files": files, "job_id": job_id}
+
+
+# ── GeoJSON endpoint for frontend attribute panel ─────────────────────────────
+
+@app.get("/geojson/{job_id}")
+def get_drainage_geojson(job_id: str):
+    """Returns the DrainageDesign GeoJSON (WGS-84) for the Leaflet map panel."""
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    output_dir = settings.get_output_dir(job_id)
+    if not os.path.exists(output_dir):
+        raise HTTPException(status_code=404, detail="No outputs found.")
+
+    # Find the DrainageDesign GeoJSON regardless of village name prefix
+    import glob as _glob
+    matches = _glob.glob(os.path.join(output_dir, "*_DrainageDesign.geojson"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="DrainageDesign GeoJSON not yet generated.")
+
+    geojson_path = matches[0]
+    return FileResponse(
+        path=geojson_path,
+        media_type="application/geo+json",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"}
+    )
 
 
 # ── Downloads ─────────────────────────────────────────────────────────────────

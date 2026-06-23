@@ -84,7 +84,7 @@ def validate_las_file(las_path: str) -> tuple:
 
 # ── Core Pipeline ─────────────────────────────────────────────────────────────
 
-def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None):
+def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None):
     """Internal: runs all 4 pipeline stages sequentially."""
 
     dtm_path = os.path.join(output_dir, f"{village_name}_DTM.tif")
@@ -144,7 +144,7 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
         update_status(job_id, 2, "Running hydrological simulation → drainage design...", percent=30)
 
         from Hydrology_pipeline import run_hydrology_pipeline
-        run_hydrology_pipeline(village_name, output_dir)
+        run_hydrology_pipeline(village_name, output_dir, stream_threshold)
 
         _record_outputs(job_id, output_dir, {
             "flow_acc":      f"{village_name}_FlowAccumulation.tif",
@@ -204,7 +204,7 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
     persist_job(job_id)
 
 
-def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None):
+def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None):
     """
     Runs the full pipeline with a timeout guard.
     If the pipeline takes longer than JOB_TIMEOUT_SECONDS, it's terminated.
@@ -212,7 +212,7 @@ def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir:
     pipeline_log(job_id, f"Pipeline started for village: {village_name}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_run_pipeline_stages, job_id, las_path, village_name, output_dir, epsg_code)
+        future = executor.submit(_run_pipeline_stages, job_id, las_path, village_name, output_dir, epsg_code, stream_threshold)
         try:
             future.result(timeout=settings.JOB_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -226,5 +226,51 @@ def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir:
             job_store[job_id]["status"] = "failed"
             job_store[job_id]["errors"].append(f"Unexpected error: {str(e)}")
             pipeline_log(job_id, f"💥 Unexpected error: {str(e)}")
-            log.error(traceback.format_exc())
             persist_job(job_id)
+
+
+def re_run_hydrology_stages(job_id: str, stream_threshold: int):
+    """
+    Fast Path: Re-runs only Stage 2 (Hydrology) and Stage 4 (Map).
+    Skips DTM breaching and Flow Accumulation.
+    """
+    if job_id not in job_store:
+        return
+
+    village_name = job_store[job_id]["village"]
+    output_dir = settings.get_output_dir(job_id)
+
+    pipeline_log(job_id, f"⚡ Fast-Path Hydrology Re-run started for: {village_name} with threshold {stream_threshold}")
+    job_store[job_id]["errors"] = []
+
+    # ── Stage 2: Hydrology (Fast Path) ─────────────────────────────────────
+    try:
+        update_status(job_id, 2, "Re-running hydrological extraction...", status="re_running", percent=40)
+
+        from Hydrology_pipeline import run_hydrology_pipeline
+        run_hydrology_pipeline(village_name, output_dir, stream_threshold, fast_path=True)
+
+        pipeline_log(job_id, "✅ Stage 2 (Fast Path) complete.")
+    except Exception as e:
+        job_store[job_id]["errors"].append(f"Stage 2 Re-run failed: {str(e)}")
+        pipeline_log(job_id, f"❌ Stage 2 Re-run error: {str(e)}")
+        log.error(traceback.format_exc())
+
+    # ── Stage 4: Interactive Map ───────────────────────────────────────────
+    try:
+        update_status(job_id, 4, "Updating interactive maps...", status="re_running", percent=85)
+
+        from InteractiveMap import run_interactive_map
+        run_interactive_map(village_name, output_dir)
+
+        pipeline_log(job_id, "✅ Stage 4 update complete.")
+    except Exception as e:
+        job_store[job_id]["errors"].append(f"Stage 4 Re-run failed: {str(e)}")
+        pipeline_log(job_id, f"❌ Stage 4 Re-run error: {str(e)}")
+        log.error(traceback.format_exc())
+
+    # ── Done ───────────────────────────────────────────────────────────────
+    final_status = "complete" if not job_store[job_id]["errors"] else "partial"
+    update_status(job_id, 4, "Hydrology Update complete!", status=final_status, percent=100)
+    pipeline_log(job_id, f"🏁 Hydrology Re-run finished with status: {final_status}")
+    persist_job(job_id)

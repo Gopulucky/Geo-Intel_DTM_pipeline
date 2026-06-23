@@ -142,10 +142,14 @@ def ensure_metric_crs(x, y, las_header=None):
         print(f"  [CRS] Using user-provided EPSG:{CONFIG.epsg}")
         return x, y
         
-    raise ValueError(
-        "CRITICAL ERROR: Coordinates appear metric but no CRS was found in the LAS header, "
-        "and no fallback EPSG was provided in CONFIG. Please provide an EPSG code via CLI."
-    )
+    if x.min() < 100000 and y.min() < 100000:
+        print("  [CRS] WARNING: Coordinates appear to be local (near 0,0). Saving without a CRS.")
+        CONFIG.epsg = None
+        return x, y
+        
+    print("  [CRS] WARNING: Coordinates appear metric but no CRS was found. Assuming UTM Zone 43N (EPSG:32643) as fallback.")
+    CONFIG.epsg = 32643
+    return x, y
 
 def load_point_cloud(las_path: str) -> pd.DataFrame:
     """
@@ -607,10 +611,11 @@ def stream_classify_and_save(las_path: str, out_las_path: str, clf: RandomForest
 
 def generate_dtm(df: pd.DataFrame, village_name: str,
                  resolution: float = None,
-                 method: str = None) -> tuple:
+                 method: str = None,
+                 ground_las_path: str = None) -> tuple:
     """
     Generate a DTM raster from classified ground points.
-    Uses scipy griddata (linear by default) on ground-only points.
+    Uses WhiteboxTools if ground_las_path is provided, else scipy griddata.
 
     Returns:
         dtm_array  : 2D numpy array of elevations (NaN for no-data)
@@ -619,6 +624,34 @@ def generate_dtm(df: pd.DataFrame, village_name: str,
     """
     res = resolution or CONFIG["dtm_resolution"]
     interp = method or CONFIG["dtm_interp"]
+
+    if ground_las_path and os.path.exists(ground_las_path):
+        import whitebox
+        wbt = whitebox.WhiteboxTools()
+        wbt.set_verbose_mode(False)
+        out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DTM.tif")
+        print(f"  Interpolating DTM ({res}m resolution) using WhiteboxTools lidar_tin_gridding...")
+        wbt.lidar_tin_gridding(
+            i=os.path.abspath(ground_las_path),
+            output=os.path.abspath(out_path),
+            parameter="elevation",
+            returns="last",
+            resolution=res
+        )
+        
+        if CONFIG.epsg is not None:
+            with rasterio.open(out_path) as src:
+                data = src.read()
+                meta = src.meta.copy()
+            meta.update({"crs": CRS.from_epsg(CONFIG.epsg)})
+            with rasterio.open(out_path, "w", **meta) as dst:
+                dst.write(data)
+
+        with rasterio.open(out_path) as src:
+            dtm = src.read(1)
+            transform = src.transform
+        print(f"  DTM saved -> {out_path}")
+        return dtm, transform, out_path
 
     gnd = df[df["pred_ground"] == 1][["x", "y", "z"]].copy()
     if len(gnd) < 100:
@@ -811,20 +844,23 @@ def run_hydrology(dtm_path: str, village_name: str,
         if os.path.exists(tmp): os.remove(tmp)
 
     # Build Hotspots Polygons simply by thresholding depth_in_sink
-    with rasterio.open(sink_depth) as src:
-        depth_arr = src.read(1).astype(float)
-        # FIX: safe nodata handling – guard against None and use np.isnan for float rasters
-        if src.nodata is not None:
-            depth_arr[depth_arr == src.nodata] = np.nan
-        depth_arr = np.where(np.isnan(depth_arr), 0.0, depth_arr)
-        hotspot_mask = depth_arr > CONFIG["depression_depth_m"]
-        
-    hotspot_polys = _raster_to_polygons(hotspot_mask, dtm_abs, min_area_m2=4.0)
-    if hotspot_polys is not None and len(hotspot_polys) > 0:
-        hp_path = out_file("WaterloggingHotspots.gpkg")
-        hotspot_polys.to_file(hp_path, driver="GPKG")
-        paths["hotspots"] = hp_path
-        print(f"  Waterlogging hotspots -> {hp_path} ({len(hotspot_polys)} zones)")
+    if os.path.exists(sink_depth):
+        with rasterio.open(sink_depth) as src:
+            depth_arr = src.read(1).astype(float)
+            # FIX: safe nodata handling – guard against None and use np.isnan for float rasters
+            if src.nodata is not None:
+                depth_arr[depth_arr == src.nodata] = np.nan
+            depth_arr = np.where(np.isnan(depth_arr), 0.0, depth_arr)
+            hotspot_mask = depth_arr > CONFIG["depression_depth_m"]
+            
+        hotspot_polys = _raster_to_polygons(hotspot_mask, dtm_abs, min_area_m2=4.0)
+        if hotspot_polys is not None and len(hotspot_polys) > 0:
+            hp_path = out_file("WaterloggingHotspots.gpkg")
+            hotspot_polys.to_file(hp_path, driver="GPKG")
+            paths["hotspots"] = hp_path
+            print(f"  Waterlogging hotspots -> {hp_path} ({len(hotspot_polys)} zones)")
+    else:
+        print(f"  [WARNING] Sink depth raster was not created by WBT at {sink_depth}. Skipping hotspot extraction.")
 
     print("  Fixing projection metadata for GeoTIFFs...")
     for out_tif in [breached, fdir, facc, streams_tif, sink_depth, twi, catchments]:
@@ -1334,7 +1370,7 @@ def run_pipeline_for_village(las_path: str, village_name: str,
 
     # 4. DTM
     print("\n[Step 4] DTM Generation...")
-    dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
+    dtm_arr, transform, dtm_path = generate_dtm(df, village_name, ground_las_path=ground_las_path)
 
     # 4b. Get DTM geographic centre for weather API
     print("\n[Step 4b] Extracting DTM geographic coordinates...")
@@ -1410,7 +1446,7 @@ def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
 
     # 2. DTM Generation
     print("\n[Step 2] DTM Generation...")
-    dtm_arr, transform, dtm_path = generate_dtm(df, village_name)
+    dtm_arr, transform, dtm_path = generate_dtm(df, village_name, ground_las_path=ground_las_path)
 
     # Free the DataFrame – no longer needed
     del df

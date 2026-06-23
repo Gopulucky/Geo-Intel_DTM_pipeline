@@ -425,7 +425,9 @@ def run_overlay_visualisation(
     _save(fig, os.path.join(output_dir, f"{village_name}_ortho_Summary.png"), dpi=150)
 
     # ── 9. Rich Folium HTML Map ───────────────────────────────────────────────
-    if not export_html or not FOLIUM_AVAILABLE or dtm_crs is None:
+    is_local_coords = (dtm_bounds.left < 100000) and (dtm_bounds.bottom < 100000)
+
+    if not export_html or not FOLIUM_AVAILABLE or (dtm_crs is None and not is_local_coords):
         if not FOLIUM_AVAILABLE:
             print("  ⚠ folium not installed — skipping HTML export (pip install folium)")
         print(f"\n  Done for {village_name}.\n")
@@ -433,143 +435,251 @@ def run_overlay_visualisation(
 
     try:
         print(f"  Creating interactive HTML map…")
-        b4326 = transform_bounds(dtm_crs, "EPSG:4326", *dtm_bounds)
-        c_lat = (b4326[1] + b4326[3]) / 2.0
-        c_lon = (b4326[0] + b4326[2]) / 2.0
-        f_bounds = [[b4326[1], b4326[0]], [b4326[3], b4326[2]]]
-
-        # ── Base map (dark Esri satellite) ────────────────────────────────────
-        m = folium.Map(
-            location=[c_lat, c_lon],
-            zoom_start=14,
-            tiles=None,
-            prefer_canvas=True,
-        )
-
-        # Tile layers
-        folium.TileLayer(
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-            attr="Esri World Imagery",
-            name="🛰 Esri Satellite",
-            overlay=False,
-            control=True,
-        ).add_to(m)
-
-        # ── DTM elevation overlay (coloured raster) ───────────────────────────
-        tw, th = 512, 512
-        dtm_t, dtm_w, dtm_h = calculate_default_transform(
-            dtm_crs, "EPSG:4326", tw, th, *dtm_bounds
-        )
-        dtm_4326 = np.full((dtm_h, dtm_w), np.nan, dtype=np.float32)
-        with rasterio.open(dtm_path) as src2:
-            reproject(
-                source       = rasterio.band(src2, 1),
-                destination  = dtm_4326,
-                src_transform= dtm_meta["transform"],
-                src_crs      = dtm_crs,
-                dst_transform= dtm_t,
-                dst_crs      = "EPSG:4326",
-                resampling   = Resampling.bilinear,
-                src_nodata   = dtm_meta["nodata"],
-                dst_nodata   = np.nan,
+        
+        if is_local_coords or dtm_crs is None:
+            print("  ⚠ Coordinates appear to be local (near 0,0) or no CRS. Using Simple CRS.")
+            c_y = (dtm_bounds.bottom + dtm_bounds.top) / 2.0
+            c_x = (dtm_bounds.left + dtm_bounds.right) / 2.0
+            f_bounds = [[dtm_bounds.bottom, dtm_bounds.left], [dtm_bounds.top, dtm_bounds.right]]
+            
+            m = folium.Map(
+                location=[c_y, c_x],
+                crs="Simple",
+                tiles=None,
+                prefer_canvas=True,
             )
-        dtm_4326_m = np.ma.masked_invalid(dtm_4326)
-        norm_dtm   = mcolors.Normalize(
-            vmin=np.nanpercentile(dtm_4326, 2),
-            vmax=np.nanpercentile(dtm_4326, 98)
-        )
-        dtm_rgba = cm.terrain(norm_dtm(dtm_4326_m))
-        dtm_rgba[dtm_4326_m.mask, 3] = 0.0     # transparent nodata
-        folium.raster_layers.ImageOverlay(
-            image=dtm_rgba, bounds=f_bounds,
-            opacity=0.45, name="🏔 DTM Elevation",
-            interactive=False, cross_origin=False,
-        ).add_to(m)
+            m.fit_bounds(f_bounds)
+            
+            # DTM Image
+            dtm_4326_m = np.ma.masked_invalid(dtm_arr)
+            norm_dtm   = mcolors.Normalize(
+                vmin=np.nanpercentile(dtm_arr, 2),
+                vmax=np.nanpercentile(dtm_arr, 98)
+            )
+            dtm_rgba = cm.terrain(norm_dtm(dtm_4326_m))
+            dtm_rgba[dtm_4326_m.mask, 3] = 0.0
+            folium.raster_layers.ImageOverlay(
+                image=dtm_rgba, bounds=f_bounds,
+                opacity=0.45, name="🏔 DTM Elevation",
+                interactive=False, cross_origin=False,
+            ).add_to(m)
+            
+            # Flow Accumulation Image
+            if flow_arr is not None:
+                fa_crop = flow_arr.copy()
+                fa_crop[fa_crop <= 10] = np.nan
+                fa_log = np.log1p(fa_crop)
+                fa_m   = np.ma.masked_invalid(fa_log)
+                if fa_m.count() > 0:
+                    norm_fa = mcolors.Normalize(
+                        vmin=np.nanpercentile(fa_log[np.isfinite(fa_log)], 2),
+                        vmax=np.nanpercentile(fa_log[np.isfinite(fa_log)], 98),
+                    )
+                    fa_rgba = cm.Blues(norm_fa(fa_m))
+                    fa_rgba[fa_m.mask, 3] = 0.0
+                    folium.raster_layers.ImageOverlay(
+                        image=fa_rgba, bounds=f_bounds,
+                        opacity=0.55, name="💧 Flow Accumulation",
+                        interactive=False, cross_origin=False,
+                    ).add_to(m)
+            
+            # Streams GeoJson
+            if streams_gdf is not None:
+                streams_local = streams_gdf.copy()
+                if "length_m" not in streams_local.columns:
+                    streams_local["length_m"] = streams_local.geometry.length.round(1)
+                
+                # Swap coordinates for folium Simple CRS
+                def swap_xy(geom):
+                    from shapely.ops import transform
+                    return transform(lambda x, y: (y, x), geom)
+                
+                streams_local.geometry = streams_local.geometry.apply(swap_xy)
+                
+                folium.GeoJson(
+                    streams_local,
+                    name="🔵 Drainage Network",
+                    style_function=lambda feat: {
+                        "color":   "#00e5ff",
+                        "weight":  2.0,
+                        "opacity": 0.85,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["length_m"] if "length_m" in streams_local.columns else [],
+                        aliases=["Length (m):"],
+                        localize=True,
+                        sticky=False,
+                    ),
+                ).add_to(m)
+                
+            # Hotspots GeoJson
+            if hotspots_gdf is not None:
+                h_local = hotspots_gdf.copy()
+                def swap_xy(geom):
+                    from shapely.ops import transform
+                    return transform(lambda x, y: (y, x), geom)
+                h_local.geometry = h_local.geometry.apply(swap_xy)
+                
+                folium.GeoJson(
+                    h_local,
+                    name="⚠ Waterlogging Hotspots",
+                    style_function=lambda feat: {
+                        "fillColor":   "#0080ff",
+                        "color":       "#ff9800",
+                        "weight":      1.2,
+                        "fillOpacity": 0.40,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=[], aliases=[],
+                        labels=False,
+                        localize=True,
+                        sticky=False,
+                        style="font-size:12px; background:#111; color:#0ff; border:none;",
+                    ),
+                    popup=folium.GeoJsonPopup(
+                        fields=[], labels=False,
+                        localize=True,
+                        max_width=150,
+                    ),
+                ).add_to(m)
 
-        # ── Flow Accumulation overlay ─────────────────────────────────────────
-        if flow_arr is not None:
-            fa_crop = flow_arr.copy()
-            fa_crop[fa_crop <= 10] = np.nan
-            fa_4326 = np.full((dtm_h, dtm_w), np.nan, dtype=np.float32)
-            with rasterio.open(flow_path) as src_fa:
+        else:
+            b4326 = transform_bounds(dtm_crs, "EPSG:4326", *dtm_bounds)
+            c_lat = (b4326[1] + b4326[3]) / 2.0
+            c_lon = (b4326[0] + b4326[2]) / 2.0
+            f_bounds = [[b4326[1], b4326[0]], [b4326[3], b4326[2]]]
+    
+            # ── Base map (dark Esri satellite) ────────────────────────────────────
+            m = folium.Map(
+                location=[c_lat, c_lon],
+                zoom_start=14,
+                tiles=None,
+                prefer_canvas=True,
+            )
+    
+            # Tile layers
+            folium.TileLayer(
+                tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                attr="Esri World Imagery",
+                name="🛰 Esri Satellite",
+                overlay=False,
+                control=True,
+            ).add_to(m)
+    
+            # ── DTM elevation overlay (coloured raster) ───────────────────────────
+            tw, th = 512, 512
+            dtm_t, dtm_w, dtm_h = calculate_default_transform(
+                dtm_crs, "EPSG:4326", tw, th, *dtm_bounds
+            )
+            dtm_4326 = np.full((dtm_h, dtm_w), np.nan, dtype=np.float32)
+            with rasterio.open(dtm_path) as src2:
                 reproject(
-                    source       = rasterio.band(src_fa, 1),
-                    destination  = fa_4326,
-                    src_transform= src_fa.transform,
-                    src_crs      = src_fa.crs,
+                    source       = rasterio.band(src2, 1),
+                    destination  = dtm_4326,
+                    src_transform= dtm_meta["transform"],
+                    src_crs      = dtm_crs,
                     dst_transform= dtm_t,
                     dst_crs      = "EPSG:4326",
                     resampling   = Resampling.bilinear,
-                    src_nodata   = src_fa.nodata,
+                    src_nodata   = dtm_meta["nodata"],
                     dst_nodata   = np.nan,
                 )
-            fa_4326[fa_4326 <= 0] = np.nan
-            fa_log = np.log1p(fa_4326)
-            fa_m   = np.ma.masked_invalid(fa_log)
-            if fa_m.count() > 0:
-                norm_fa = mcolors.Normalize(
-                    vmin=np.nanpercentile(fa_log[np.isfinite(fa_log)], 2),
-                    vmax=np.nanpercentile(fa_log[np.isfinite(fa_log)], 98),
-                )
-                fa_rgba = cm.Blues(norm_fa(fa_m))
-                fa_rgba[fa_m.mask, 3] = 0.0
-                folium.raster_layers.ImageOverlay(
-                    image=fa_rgba, bounds=f_bounds,
-                    opacity=0.55, name="💧 Flow Accumulation",
-                    interactive=False, cross_origin=False,
+            dtm_4326_m = np.ma.masked_invalid(dtm_4326)
+            norm_dtm   = mcolors.Normalize(
+                vmin=np.nanpercentile(dtm_4326, 2),
+                vmax=np.nanpercentile(dtm_4326, 98)
+            )
+            dtm_rgba = cm.terrain(norm_dtm(dtm_4326_m))
+            dtm_rgba[dtm_4326_m.mask, 3] = 0.0     # transparent nodata
+            folium.raster_layers.ImageOverlay(
+                image=dtm_rgba, bounds=f_bounds,
+                opacity=0.45, name="🏔 DTM Elevation",
+                interactive=False, cross_origin=False,
+            ).add_to(m)
+    
+            # ── Flow Accumulation overlay ─────────────────────────────────────────
+            if flow_arr is not None:
+                fa_crop = flow_arr.copy()
+                fa_crop[fa_crop <= 10] = np.nan
+                fa_4326 = np.full((dtm_h, dtm_w), np.nan, dtype=np.float32)
+                with rasterio.open(flow_path) as src_fa:
+                    reproject(
+                        source       = rasterio.band(src_fa, 1),
+                        destination  = fa_4326,
+                        src_transform= src_fa.transform,
+                        src_crs      = src_fa.crs,
+                        dst_transform= dtm_t,
+                        dst_crs      = "EPSG:4326",
+                        resampling   = Resampling.bilinear,
+                        src_nodata   = src_fa.nodata,
+                        dst_nodata   = np.nan,
+                    )
+                fa_4326[fa_4326 <= 0] = np.nan
+                fa_log = np.log1p(fa_4326)
+                fa_m   = np.ma.masked_invalid(fa_log)
+                if fa_m.count() > 0:
+                    norm_fa = mcolors.Normalize(
+                        vmin=np.nanpercentile(fa_log[np.isfinite(fa_log)], 2),
+                        vmax=np.nanpercentile(fa_log[np.isfinite(fa_log)], 98),
+                    )
+                    fa_rgba = cm.Blues(norm_fa(fa_m))
+                    fa_rgba[fa_m.mask, 3] = 0.0
+                    folium.raster_layers.ImageOverlay(
+                        image=fa_rgba, bounds=f_bounds,
+                        opacity=0.55, name="💧 Flow Accumulation",
+                        interactive=False, cross_origin=False,
+                    ).add_to(m)
+    
+            # ── Stream network (GeoJSON with tooltips) ────────────────────────────
+            if streams_gdf is not None:
+                streams_4326 = streams_gdf.to_crs("EPSG:4326")
+                # add length if not present
+                if "length_m" not in streams_4326.columns:
+                    streams_4326["length_m"] = streams_4326.to_crs(
+                        streams_gdf.crs).geometry.length.round(1)
+    
+                folium.GeoJson(
+                    streams_4326,
+                    name="🔵 Drainage Network",
+                    style_function=lambda feat: {
+                        "color":   "#00e5ff",
+                        "weight":  2.0,
+                        "opacity": 0.85,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["length_m"] if "length_m" in streams_4326.columns else [],
+                        aliases=["Length (m):"],
+                        localize=True,
+                        sticky=False,
+                    ),
                 ).add_to(m)
-
-        # ── Stream network (GeoJSON with tooltips) ────────────────────────────
-        if streams_gdf is not None:
-            streams_4326 = streams_gdf.to_crs("EPSG:4326")
-            # add length if not present
-            if "length_m" not in streams_4326.columns:
-                streams_4326["length_m"] = streams_4326.to_crs(
-                    streams_gdf.crs).geometry.length.round(1)
-
-            folium.GeoJson(
-                streams_4326,
-                name="🔵 Drainage Network",
-                style_function=lambda feat: {
-                    "color":   "#00e5ff",
-                    "weight":  2.0,
-                    "opacity": 0.85,
-                },
-                tooltip=folium.GeoJsonTooltip(
-                    fields=["length_m"] if "length_m" in streams_4326.columns else [],
-                    aliases=["Length (m):"],
-                    localize=True,
-                    sticky=False,
-                ),
-            ).add_to(m)
-
-
-        # ── Waterlogging hotspots (polygons with popup) ───────────────────────
-        if hotspots_gdf is not None:
-            h_4326 = hotspots_gdf.to_crs("EPSG:4326")
-            folium.GeoJson(
-                h_4326,
-                name="⚠ Waterlogging Hotspots",
-                style_function=lambda feat: {
-                    "fillColor":   "#0080ff",
-                    "color":       "#ff9800",
-                    "weight":      1.2,
-                    "fillOpacity": 0.40,
-                },
-                tooltip=folium.GeoJsonTooltip(
-                    fields=[], aliases=[],
-                    labels=False,
-                    localize=True,
-                    sticky=False,
-                    style="font-size:12px; background:#111; color:#0ff; border:none;",
-                ),
-                popup=folium.GeoJsonPopup(
-                    fields=[], labels=False,
-                    localize=True,
-                    max_width=150,
-                ),
-            ).add_to(m)
-
+    
+    
+            # ── Waterlogging hotspots (polygons with popup) ───────────────────────
+            if hotspots_gdf is not None:
+                h_4326 = hotspots_gdf.to_crs("EPSG:4326")
+                folium.GeoJson(
+                    h_4326,
+                    name="⚠ Waterlogging Hotspots",
+                    style_function=lambda feat: {
+                        "fillColor":   "#0080ff",
+                        "color":       "#ff9800",
+                        "weight":      1.2,
+                        "fillOpacity": 0.40,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=[], aliases=[],
+                        labels=False,
+                        localize=True,
+                        sticky=False,
+                        style="font-size:12px; background:#111; color:#0ff; border:none;",
+                    ),
+                    popup=folium.GeoJsonPopup(
+                        fields=[], labels=False,
+                        localize=True,
+                        max_width=150,
+                    ),
+                ).add_to(m)
         # ── Bounding-box rectangle to show study area ─────────────────────────
         folium.Rectangle(
             bounds=f_bounds,
@@ -634,8 +744,10 @@ def run_overlay_visualisation(
 
 if __name__ == "__main__":
     import sys
-    OUTPUT_DIR = "/content/outputs"     # ← change to your path
-    if os.path.exists("./outputs"): OUTPUT_DIR = "./outputs" # Fallback for local
+    import os
+    OUTPUT_DIR = os.environ.get("OUTPUTS_DIR", "/content/outputs")
+    if os.path.exists("./outputs") and not "OUTPUTS_DIR" in os.environ:
+        OUTPUT_DIR = "./outputs" # Fallback for local
 
     VILLAGES = [
         {"name": "DEVDI_511671", "epsg": 32643},
@@ -652,7 +764,12 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1:
         target = sys.argv[1]
-        VILLAGES = [v for v in VILLAGES if v["name"] == target]
+        # Match by exact name or process the target directly
+        matched = [v for v in VILLAGES if v["name"] == target]
+        if not matched:
+            VILLAGES = [{"name": target, "epsg": None}]
+        else:
+            VILLAGES = matched
 
     for v in VILLAGES:
         village_output_dir = f"{OUTPUT_DIR}/{v['name']}"

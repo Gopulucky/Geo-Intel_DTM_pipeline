@@ -167,7 +167,11 @@ if __name__ == "__main__":
     if not os.path.exists(OUTPUTS_DIR):
         print("❌ Outputs folder not found! Please run DTM and Hydrology pipelines first.")
     else:
-        villages = sorted([d for d in os.listdir(OUTPUTS_DIR) if os.path.isdir(os.path.join(OUTPUTS_DIR, d))])
+        if len(sys.argv) > 1:
+            villages = [sys.argv[1]]
+        else:
+            villages = sorted([d for d in os.listdir(OUTPUTS_DIR) if os.path.isdir(os.path.join(OUTPUTS_DIR, d))])
+
         model_out = os.path.join(OUTPUTS_DIR, "lulc_rf_model.joblib")
 
         for village in villages:

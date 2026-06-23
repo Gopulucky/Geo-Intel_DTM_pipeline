@@ -13,14 +13,26 @@ import matplotlib.animation as animation
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.colors
 
-import sys
-if len(sys.argv) < 3:
-    print("Usage: python hydrology_with_buildings.py <input_las_path> <output_dir>")
+import glob
+
+if len(sys.argv) < 2:
+    print("Usage: python hydrology_with_buildings.py <village_name>")
     sys.exit(1)
 
-input_las = sys.argv[1]
-output_dir = sys.argv[2]
+village_name = sys.argv[1]
+base_dir = os.environ.get("BASE_DIR", os.path.abspath(os.path.dirname(__file__)))
+input_dir = os.environ.get("INPUTS_DIR", os.path.join(base_dir, "input_data"))
+output_base = os.environ.get("OUTPUTS_DIR", os.path.join(base_dir, "outputs"))
+
+output_dir = os.path.join(output_base, village_name)
 os.makedirs(output_dir, exist_ok=True)
+
+# Find LAS file
+las_paths = glob.glob(os.path.join(input_dir, "**", f"*{village_name}*.[lL][aA][sSzZ]"), recursive=True)
+if not las_paths:
+    print(f"Error: Could not find point cloud for {village_name} in {input_dir}")
+    sys.exit(1)
+input_las = las_paths[0]
 
 # Add pipeline to path to reuse functions
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -191,9 +203,9 @@ def animate_hydrology(hydro_paths, out_gif_hotspots, out_gif_streams):
     plt.close(fig2)
 
 if __name__ == "__main__":
-    dsm_tif = os.path.join(output_dir, "DEVDI_DSM.tif")
-    out_gif_hotspots = os.path.join(output_dir, "Hydrology_Animation_Hotspots.gif")
-    out_gif_streams = os.path.join(output_dir, "Hydrology_Animation_Streams.gif")
+    dsm_tif = os.path.join(output_dir, f"{village_name}_DSM.tif")
+    out_gif_hotspots = os.path.join(output_dir, f"{village_name}_Hydrology_Animation_Hotspots.gif")
+    out_gif_streams = os.path.join(output_dir, f"{village_name}_Hydrology_Animation_Streams.gif")
     
     # We can skip recreating the DSM if it exists to save time, but for completeness:
     if not os.path.exists(dsm_tif):

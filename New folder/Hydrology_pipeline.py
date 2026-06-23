@@ -575,8 +575,8 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     DRAIN_VECTOR   = f"{pfx}_AlternateDrainage.shp"
 
     print(f"\n{'='*60}")
-    print(f"  HYDROLOGY PIPELINE  →  {pfx}")
-    print(f"  Stream threshold    →  {stream_threshold} cells")
+    print(f"  HYDROLOGY PIPELINE  ->  {pfx}")
+    print(f"  Stream threshold    ->  {stream_threshold} cells")
     print(f"{'='*60}")
 
     wbt = setup_whitebox(work_dir)

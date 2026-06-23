@@ -117,13 +117,13 @@ function Legend({ type }) {
   const items = legends[type] || legends.lulc;
 
   return (
-    <div className="absolute bottom-4 right-4 z-[1000] bg-white rounded-xl shadow-lg p-3 text-xs">
-      <p className="font-semibold text-gray-700 mb-2 font-display">Legend</p>
+    <div className="absolute bottom-6 right-2 z-[1000] bg-slate-900/90 backdrop-blur border border-slate-700/80 rounded-xl shadow-lg p-3 text-[10px]">
+      <p className="font-semibold text-slate-300 mb-2 font-display uppercase tracking-widest text-[9px]">Legend</p>
       {items.map((item, i) => (
         <div key={i} className="flex items-center gap-2 mb-1">
-          <div className="w-4 h-4 rounded-sm border border-gray-200 flex-shrink-0"
+          <div className="w-3 h-3 rounded-sm flex-shrink-0 border border-slate-700"
                style={{ background: item.color }} />
-          <span className="text-gray-600">{item.label}</span>
+          <span className="text-slate-400">{item.label}</span>
         </div>
       ))}
     </div>
@@ -141,7 +141,6 @@ export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
   const [error,    setError]    = useState(null);
   const [stats,    setStats]    = useState(null);   // min/max values
   const [coords,   setCoords]   = useState(null);   // mouse position
-  const [pixelVal, setPixelVal] = useState(null);   // value under cursor
 
   // ── Initialize Leaflet map ────────────────────────────────────────────────
   useEffect(() => {
@@ -151,9 +150,8 @@ export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
       center: [20.5, 78.9],
       zoom: 5,
       zoomControl: true,
+      attributionControl: false,
     });
-
-    // Base layer removed per request. Leaflet map background will be transparent/grey.
 
     // Show coordinates on mouse move (like QGIS status bar)
     map.on("mousemove", (e) => {
@@ -191,19 +189,24 @@ export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
 
       // Step 3: Create colored layer (applies color map like QGIS symbology)
       .then(georaster => {
-        const min = georaster.mins[0];
-        const max = georaster.maxs[0];
-        setStats({ min: min.toFixed(2), max: max.toFixed(2) });
+        const min = georaster.mins ? georaster.mins[0] : undefined;
+        const max = georaster.maxs ? georaster.maxs[0] : undefined;
+        
+        if (min !== undefined && max !== undefined && min !== null && max !== null) {
+          setStats({ min: min.toFixed(2), max: max.toFixed(2) });
+        } else {
+          setStats({ min: "N/A", max: "N/A" });
+        }
 
+        const safeMin = min ?? 0;
+        const safeMax = max ?? 1;
         const colorFn = COLOR_MAPS[type] || COLOR_MAPS.lulc;
 
         const layer = new GeoRasterLayer({
           georaster,
           opacity: 0.85,
-          resolution: 512,  // higher = sharper but slower
-
-          // This is the QGIS "symbology" equivalent
-          pixelValuesToColorFn: (values) => colorFn(values, min, max),
+          resolution: 256,  // balance quality/speed
+          pixelValuesToColorFn: (values) => colorFn(values, safeMin, safeMax),
         });
 
         layer.addTo(mapInstance.current);
@@ -211,14 +214,6 @@ export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
 
         // Zoom to .tif extent (like QGIS "Zoom to Layer")
         mapInstance.current.fitBounds(layer.getBounds());
-
-        // Show pixel value on click (like QGIS "Identify Features")
-        mapInstance.current.on("click", (e) => {
-          const { lat, lng } = e.latlng;
-          // Convert lat/lng to pixel and get value
-          // (simplified — full implementation needs coordinate transform)
-          console.log(`Clicked: ${lat.toFixed(4)}, ${lng.toFixed(4)}`);
-        });
 
         setLoading(false);
       })
@@ -233,51 +228,45 @@ export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div className="relative w-full h-full rounded-xl overflow-hidden border border-green-100 shadow-md">
+    <div className="relative w-full h-full rounded-xl overflow-hidden border border-slate-700 shadow-md bg-slate-950">
 
       {/* Map Title Bar */}
-      <div className="absolute top-0 left-0 right-0 z-[1000] bg-white/90 backdrop-blur px-4 py-2 flex items-center justify-between border-b border-green-100">
-        <span className="font-semibold text-green-800 text-sm font-display">{title}</span>
+      <div className="absolute top-0 left-0 right-0 z-[1000] bg-slate-900/90 backdrop-blur px-3 py-1.5 flex items-center justify-between border-b border-slate-800">
+        <span className="font-semibold text-slate-200 text-[11px] font-display">{title}</span>
         {stats && (
-          <span className="text-xs text-gray-500">
-            Range: {stats.min} — {stats.max}
+          <span className="text-[10px] text-slate-400 font-mono">
+            {stats.min} — {stats.max}
           </span>
         )}
       </div>
 
       {/* Loading Overlay */}
       {loading && (
-        <div className="absolute inset-0 z-[999] bg-white/80 flex flex-col items-center justify-center gap-3">
-          <div className="w-10 h-10 border-4 border-green-200 border-t-green-600 rounded-full animate-spin" />
-          <p className="text-green-700 font-medium text-sm">Loading {type.toUpperCase()} map...</p>
+        <div className="absolute inset-0 z-[999] bg-slate-900/80 backdrop-blur flex flex-col items-center justify-center gap-3">
+          <div className="w-8 h-8 border-4 border-slate-700 border-t-teal-500 rounded-full animate-spin" />
+          <p className="text-teal-400 font-medium text-xs">Loading raster data...</p>
         </div>
       )}
 
       {/* Error State */}
       {error && (
-        <div className="absolute inset-0 z-[999] bg-red-50 flex flex-col items-center justify-center gap-2 p-4">
+        <div className="absolute inset-0 z-[999] bg-red-950/80 backdrop-blur flex flex-col items-center justify-center gap-2 p-4 text-center">
           <span className="text-2xl">⚠️</span>
-          <p className="text-red-700 font-medium text-center text-sm">{error}</p>
-          <button
-            onClick={() => window.location.reload()}
-            className="mt-2 px-4 py-2 bg-red-600 text-white rounded-lg text-sm"
-          >
-            Retry
-          </button>
+          <p className="text-red-400 font-medium text-xs">{error}</p>
         </div>
       )}
 
       {/* Leaflet Map Container */}
-      <div ref={mapRef} style={{ height: "100%", width: "100%", paddingTop: "40px" }} />
+      <div ref={mapRef} style={{ height: "100%", width: "100%", paddingTop: "30px" }} />
 
       {/* Legend */}
       {!loading && !error && <Legend type={type} />}
 
       {/* Coordinates Status Bar (like QGIS bottom bar) */}
       {coords && (
-        <div className="absolute bottom-0 left-0 right-0 z-[1000] bg-white/90 backdrop-blur px-3 py-1 text-xs text-gray-500 border-t border-green-100 flex gap-4">
-          <span>📍 Lat: {coords.lat}</span>
-          <span>Lng: {coords.lng}</span>
+        <div className="absolute bottom-0 left-0 right-0 z-[1000] bg-slate-900/90 backdrop-blur px-3 py-1 text-[10px] text-slate-400 border-t border-slate-800 flex gap-4 font-mono">
+          <span>📍 {coords.lat}°N</span>
+          <span>{coords.lng}°E</span>
         </div>
       )}
     </div>

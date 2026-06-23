@@ -486,13 +486,40 @@ def convert_all_to_cog(work_dir, pfx):
         os.rmdir(cog_dir)
     print("✅ All rasters converted to COG.")
 
-def adaptive_flow_threshold(dtm_path: str, target_stream_density: float = 0.005) -> int:
+def manning_discharge(width, depth, slope, roughness):
+    """Computes minimum discharge automatically from channel geometry."""
+    A = width * depth
+    wetted_perimeter = width + 2*depth
+    R = A / wetted_perimeter
+    velocity = (1/roughness) * (R**(2/3)) * (slope**0.5)
+    Q = A * velocity
+    return Q
+
+def rainfall_based_threshold(
+        dtm_path,
+        rainfall_intensity_mmhr,
+        runoff_coefficient=0.5,
+        minimum_discharge=0.1):
+    """Compute flow accumulation threshold using Rational Method."""
     with rasterio.open(dtm_path) as src:
-        total_cells = src.height * src.width
-    return max(50, int(total_cells * target_stream_density))
+        cell_size_x = abs(src.transform[0])
+        cell_size_y = abs(src.transform[4])
+        cell_area = cell_size_x * cell_size_y
+
+    # Rational Method: Q = CIA -> A = Q / (CI * conversion)
+    area_ha = minimum_discharge / (0.00278 * runoff_coefficient * rainfall_intensity_mmhr)
+
+    # hectares to m²
+    area_m2 = area_ha * 10000
+
+    # Convert to number of cells
+    threshold_cells = int(area_m2 / cell_area)
+
+    return max(10, threshold_cells)
 
 def run_village_pipeline(work_dir: str, dtm_filename: str,
-                         stream_threshold: int = None):
+                         stream_threshold: int = None,
+                         fast_path: bool = False):
     """
     Run the full hydrology pipeline for one village DTM.
 
@@ -510,7 +537,22 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
         return
         
     if stream_threshold is None:
-        stream_threshold = adaptive_flow_threshold(dtm_path)
+        # 1. Compute minimum discharge using Manning Equation for a small headwater channel
+        Qmin = manning_discharge(
+            width=0.5,       # 0.5m wide
+            depth=0.3,       # 0.3m deep
+            slope=0.001,     # typical flat terrain slope
+            roughness=0.035  # natural channel with weeds/stones
+        )
+        print(f"  Physics-based minimum discharge (Manning): {Qmin:.3f} m³/s")
+        
+        # 2. Compute the flow accumulation threshold using Rational Method
+        stream_threshold = rainfall_based_threshold(
+            dtm_path,
+            rainfall_intensity_mmhr=100,  # 100mm/hr design storm
+            runoff_coefficient=0.6,       # typical for rural/village areas
+            minimum_discharge=Qmin
+        )
 
     # ── Auto-generate output file names from the DTM prefix ──────────────────
     pfx            = dtm_filename.replace("_DTM.tif", "")
@@ -544,8 +586,12 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
         print(f"🚨 CRS check failed for {dtm_filename} – aborting this village.")
         return
 
-    step1_hydrological_breaching(wbt, dtm_filename, BREACHED_DTM)
-    step2_flow_modeling(wbt, BREACHED_DTM, FDIR, FACC)
+    if not fast_path:
+        step1_hydrological_breaching(wbt, dtm_filename, BREACHED_DTM)
+        step2_flow_modeling(wbt, BREACHED_DTM, FDIR, FACC)
+    else:
+        print("⚡ FAST PATH ENABLED: Skipping DTM Breaching and Flow Accumulation (using existing files).")
+
     step3_stream_extraction_and_smoothing(
         wbt, FACC, FDIR, RASTER_STREAMS, VECTOR_STREAMS,
         threshold=stream_threshold, dtm_crs=dtm_crs
@@ -608,7 +654,7 @@ if __name__ == "__main__":
 # WRAPPER FOR BACKEND
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_hydrology_pipeline(village_name: str, output_dir: str):
+def run_hydrology_pipeline(village_name: str, output_dir: str, stream_threshold: int = None, fast_path: bool = False):
     """Full Hydrology pipeline wrapper for the web backend."""
     print(f"🚀 Starting Hydrology Pipeline for {village_name}...")
     
@@ -619,6 +665,7 @@ def run_hydrology_pipeline(village_name: str, output_dir: str):
     run_village_pipeline(
         work_dir = output_dir,
         dtm_filename = dtm_filename,
-        stream_threshold = None
+        stream_threshold = stream_threshold,
+        fast_path = fast_path
     )
     print(f"✅ Hydrology Pipeline finished for {village_name}")

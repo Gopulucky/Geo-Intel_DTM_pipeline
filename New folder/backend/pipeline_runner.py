@@ -84,7 +84,7 @@ def validate_las_file(las_path: str) -> tuple:
 
 # ── Core Pipeline ─────────────────────────────────────────────────────────────
 
-def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None):
+def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None, rainfall_scenario: str = "flood"):
     """Internal: runs all 4 pipeline stages sequentially."""
 
     dtm_path = os.path.join(output_dir, f"{village_name}_DTM.tif")
@@ -144,7 +144,7 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
         update_status(job_id, 2, "Running hydrological simulation → drainage design...", percent=30)
 
         from Hydrology_pipeline import run_hydrology_pipeline
-        run_hydrology_pipeline(village_name, output_dir, stream_threshold)
+        run_hydrology_pipeline(las_path, village_name, output_dir, stream_threshold, rainfall_scenario=rainfall_scenario)
 
         _record_outputs(job_id, output_dir, {
             "flow_acc":      f"{village_name}_FlowAccumulation.tif",
@@ -153,6 +153,8 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
             "catchments":    f"{village_name}_Catchments.tif",
             "hotspots_gpkg": f"{village_name}_WaterloggingHotspots.gpkg",
             "drainage_gpkg": f"{village_name}_DrainageDesign.gpkg",
+            "hotspots_gif":  f"{village_name}_Hydrology_Animation_Hotspots.gif",
+            "streams_gif":   f"{village_name}_Hydrology_Animation_Streams.gif",
         })
         pipeline_log(job_id, "✅ Stage 2 complete.")
 
@@ -161,27 +163,10 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
         pipeline_log(job_id, f"❌ Stage 2 error: {str(e)}")
         log.error(traceback.format_exc())
 
-    # ── Stage 3: LULC Classification ───────────────────────────────────────
-    try:
-        update_status(job_id, 3, "Classifying land use with Random Forest ML...", percent=60)
-
-        from lulc_pipeline import run_lulc_pipeline
-        run_lulc_pipeline(village_name, output_dir)
-
-        _record_outputs(job_id, output_dir, {
-            "lulc_tif": f"{village_name}_LULC.tif",
-            "lulc_png": f"{village_name}_LULC_Map.png",
-        })
-        pipeline_log(job_id, "✅ Stage 3 complete.")
-
-    except Exception as e:
-        job_store[job_id]["errors"].append(f"Stage 3 (LULC) failed: {str(e)}")
-        pipeline_log(job_id, f"❌ Stage 3 error: {str(e)}")
-        log.error(traceback.format_exc())
 
     # ── Stage 4: Interactive Map ───────────────────────────────────────────
     try:
-        update_status(job_id, 4, "Generating interactive maps and summary report...", percent=85)
+        update_status(job_id, 3, "Generating interactive maps and summary report...", percent=85)
 
         from InteractiveMap import run_interactive_map
         run_interactive_map(village_name, output_dir)
@@ -204,7 +189,7 @@ def _run_pipeline_stages(job_id: str, las_path: str, village_name: str, output_d
     persist_job(job_id)
 
 
-def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None):
+def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir: str, epsg_code: str = None, stream_threshold: int = None, rainfall_scenario: str = "flood"):
     """
     Runs the full pipeline with a timeout guard.
     If the pipeline takes longer than JOB_TIMEOUT_SECONDS, it's terminated.
@@ -212,7 +197,7 @@ def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir:
     pipeline_log(job_id, f"Pipeline started for village: {village_name}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_run_pipeline_stages, job_id, las_path, village_name, output_dir, epsg_code, stream_threshold)
+        future = executor.submit(_run_pipeline_stages, job_id, las_path, village_name, output_dir, epsg_code, stream_threshold, rainfall_scenario)
         try:
             future.result(timeout=settings.JOB_TIMEOUT_SECONDS)
         except concurrent.futures.TimeoutError:
@@ -229,7 +214,7 @@ def run_full_pipeline(job_id: str, las_path: str, village_name: str, output_dir:
             persist_job(job_id)
 
 
-def re_run_hydrology_stages(job_id: str, stream_threshold: int):
+def re_run_hydrology_stages(job_id: str, stream_threshold: int = None, rainfall_scenario: str = "flood"):
     """
     Fast Path: Re-runs only Stage 2 (Hydrology) and Stage 4 (Map).
     Skips DTM breaching and Flow Accumulation.
@@ -248,7 +233,7 @@ def re_run_hydrology_stages(job_id: str, stream_threshold: int):
         update_status(job_id, 2, "Re-running hydrological extraction...", status="re_running", percent=40)
 
         from Hydrology_pipeline import run_hydrology_pipeline
-        run_hydrology_pipeline(village_name, output_dir, stream_threshold, fast_path=True)
+        run_hydrology_pipeline(village_name, output_dir, stream_threshold, fast_path=True, rainfall_scenario=rainfall_scenario)
 
         pipeline_log(job_id, "✅ Stage 2 (Fast Path) complete.")
     except Exception as e:

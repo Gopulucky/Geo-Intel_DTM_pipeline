@@ -52,7 +52,7 @@ function dtmColor(values, min, max) {
 
 // ── Main Component ────────────────────────────────────────────────────────────
 
-export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, selectedFeatureId }) {
+export default function DrainageMapPanel({ dtmUrl, geojsonData, dynamicGeojsonData, onFeatureClick, selectedFeatureId }) {
   const mapRef      = useRef(null);
   const mapInst     = useRef(null);
   const dtmLayer    = useRef(null);
@@ -63,6 +63,7 @@ export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, 
   const [streamLoading, setStreamLoading] = useState(false);
   const [coords,        setCoords]        = useState(null);
   const [hoveredId,     setHoveredId]     = useState(null);
+  const [viewMode,      setViewMode]      = useState("baseline"); // "baseline" | "dynamic"
 
   // ── Init Leaflet map ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -129,19 +130,23 @@ export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, 
       });
   }, [dtmUrl]);
 
-  // ── Render GeoJSON stream network ─────────────────────────────────────────
+  // ── Render Stream GeoJSON ─────────────────────────────────────────────────
   useEffect(() => {
-    if (!geojsonData || !mapInst.current) return;
+    if (!mapInst.current) return;
 
+    const activeGeojson = viewMode === "baseline" ? geojsonData : dynamicGeojsonData;
+
+    // Clear existing
     if (streamLayer.current) {
       mapInst.current.removeLayer(streamLayer.current);
       streamLayer.current = null;
     }
 
-    setStreamLoading(true);
+    if (!activeGeojson || !activeGeojson.features) return;
 
+    setStreamLoading(true);
     try {
-      const layer = L.geoJSON(geojsonData, {
+      const layer = L.geoJSON(activeGeojson, {
         style: (feature) => {
           const isSelected = feature?.properties?.id === selectedFeatureId;
           const base = streamStyle(feature);
@@ -179,7 +184,7 @@ export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, 
       streamLayer.current = layer;
 
       // If DTM hasn't loaded yet, fit to streams
-      if (!dtmLayer.current && geojsonData.features?.length) {
+      if (!dtmLayer.current && activeGeojson.features?.length) {
         mapInst.current.fitBounds(layer.getBounds(), { padding: [30, 30] });
       }
       setStreamLoading(false);
@@ -187,7 +192,7 @@ export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, 
       console.error("GeoJSON render error:", err);
       setStreamLoading(false);
     }
-  }, [geojsonData, onFeatureClick]);
+  }, [geojsonData, dynamicGeojsonData, viewMode, onFeatureClick]);
 
   // Re-style when selection changes
   useEffect(() => {
@@ -246,6 +251,24 @@ export default function DrainageMapPanel({ dtmUrl, geojsonData, onFeatureClick, 
           <span className="text-amber-300">Selected segment</span>
         </div>
       </div>
+
+      {/* View Toggle */}
+      {dynamicGeojsonData && (
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[900] bg-slate-900/80 backdrop-blur-md border border-slate-700/50 rounded-xl p-1 flex gap-1 shadow-lg">
+          <button 
+            onClick={() => setViewMode("baseline")}
+            className={`px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors ${viewMode === "baseline" ? "bg-blue-600 text-white" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"}`}
+          >
+            Engineering Baseline
+          </button>
+          <button 
+            onClick={() => setViewMode("dynamic")}
+            className={`px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors ${viewMode === "dynamic" ? "bg-teal-600 text-white" : "text-slate-400 hover:text-slate-200 hover:bg-slate-800"}`}
+          >
+            Dynamic Weather
+          </button>
+        </div>
+      )}
 
       {/* Stream loading indicator */}
       {streamLoading && (

@@ -29,7 +29,6 @@ const STRAHLER_LABELS = { 1: "1st — Headwater", 2: "2nd — Minor", 3: "3rd �
 const STRAHLER_COLORS = { 1: "#60a5fa", 2: "#3b82f6", 3: "#2563eb", 4: "#1d4ed8", 5: "#1e3a8a" };
 
 const TIF_CONFIGS = [
-  { suffix: "_LULC.tif",             type: "lulc",      title: "🌱 LULC Classification" },
   { suffix: "_DTM.tif",              type: "dtm",       title: "🏔️ Digital Terrain Model" },
   { suffix: "_FlowAccumulation.tif", type: "hydrology", title: "💧 Flow Accumulation" },
   { suffix: "_TWI.tif",              type: "hydrology", title: "💦 Topographic Wetness Index" },
@@ -71,6 +70,84 @@ function StatRow({ label, value, unit, highlight }) {
       <span className={`text-[11px] lg:text-xs font-mono font-bold ${highlight ? "text-teal-300 drop-shadow-sm" : "text-slate-200"}`}>
         {value}{unit ? <span className="text-slate-500 ml-1 font-normal">{unit}</span> : null}
       </span>
+    </div>
+  );
+}
+
+// ── Hydraulic Inspector Panel ─────────────────────────────────────────────────
+
+function RainfallMetricsPanel({ metrics }) {
+  if (!metrics) return (
+    <p className="text-[11px] text-slate-500 text-center py-4 font-medium">No rainfall metrics available for this run.</p>
+  );
+
+  const { baseline, dynamic, comparison } = metrics;
+  const scenario = metrics.scenario || "flood";
+
+  const rows = [
+    { label: "Historical Max Rainfall", baseline: "—", dynamic: `${dynamic.historical_max_daily_mm?.toFixed(1) ?? "—"} mm/day` },
+    { label: "Scenario Rainfall", baseline: "—", dynamic: `${dynamic.historical_scenario_daily_mm?.toFixed(1) ?? "—"} mm/day` },
+    { label: "Weather Ratio", baseline: "1.00", dynamic: dynamic.weather_ratio?.toFixed(2) ?? "—" },
+    { label: "Engineering Intensity", baseline: `${baseline.intensity_mm_hr} mm/hr`, dynamic: `${dynamic.normalized_intensity_mm_hr} mm/hr`, highlight: true },
+    { label: "Stream Threshold", baseline: `${baseline.stream_threshold_cells?.toLocaleString()} cells`, dynamic: `${dynamic.stream_threshold_cells?.toLocaleString()} cells`, highlight: true },
+  ];
+
+  const isPositive = comparison.threshold_difference_cells > 0;
+  const isZero = comparison.threshold_difference_cells === 0;
+
+  return (
+    <div className="space-y-3">
+      {/* Scenario Badge */}
+      <div className="flex items-center justify-center">
+        <span className={`text-[11px] font-bold uppercase tracking-widest px-4 py-1.5 rounded-full border ${
+          scenario === "flood"
+            ? "bg-red-500/10 text-red-400 border-red-500/30"
+            : "bg-blue-500/10 text-blue-400 border-blue-500/30"
+        }`}>
+          {scenario === "flood" ? "🌊 Flood Simulation" : "💧 Waterlogging Simulation"}
+        </span>
+      </div>
+
+      {/* Comparison Table */}
+      <div className="rounded-xl border border-slate-700/60 overflow-hidden">
+        {/* Header */}
+        <div className="grid grid-cols-3 bg-slate-800/90 px-3 py-2.5 border-b border-slate-700/50">
+          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Metric</span>
+          <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider text-right">Baseline (i=80)</span>
+          <span className="text-[10px] font-bold text-teal-400 uppercase tracking-wider text-right">Dynamic</span>
+        </div>
+        {/* Rows */}
+        {rows.map((r, i) => (
+          <div key={i} className={`grid grid-cols-3 px-3 py-2 border-b border-slate-800/60 ${r.highlight ? "bg-teal-500/5" : "hover:bg-slate-800/40"} transition-colors`}>
+            <span className="text-[10px] lg:text-[11px] text-slate-400 font-medium">{r.label}</span>
+            <span className="text-[10px] lg:text-[11px] font-mono text-slate-300 text-right">{r.baseline}</span>
+            <span className={`text-[10px] lg:text-[11px] font-mono font-bold text-right ${r.highlight ? "text-teal-300" : "text-slate-200"}`}>{r.dynamic}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Impact Summary */}
+      <div className={`rounded-xl p-3 border ${
+        isZero
+          ? "bg-slate-800/40 border-slate-700/50"
+          : isPositive
+            ? "bg-amber-500/5 border-amber-500/20"
+            : "bg-green-500/5 border-green-500/20"
+      }`}>
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider">Impact</span>
+          <span className={`text-[11px] font-bold font-mono ${
+            isZero ? "text-slate-300" : isPositive ? "text-amber-400" : "text-green-400"
+          }`}>
+            {isZero ? "No change" : `${comparison.threshold_difference_pct > 0 ? "+" : ""}${comparison.threshold_difference_pct}%`}
+          </span>
+        </div>
+        <p className={`text-[10px] mt-1 font-medium ${
+          isZero ? "text-slate-500" : isPositive ? "text-amber-500/80" : "text-green-500/80"
+        }`}>
+          {comparison.stream_density_impact}
+        </p>
+      </div>
     </div>
   );
 }
@@ -169,8 +246,10 @@ export default function ResultsPage() {
   const [job,            setJob]            = useState(null);
   const [loadError,      setLoadError]      = useState(null);
   const [geojsonData,    setGeojsonData]    = useState(null);
+  const [dynamicGeojsonData, setDynamicGeojsonData] = useState(null);
   const [geojsonError,   setGeojsonError]   = useState(null);
   const [selectedFeature, setSelectedFeature] = useState(null);
+  const [rainfallMetrics, setRainfallMetrics] = useState(null);
 
   // Responsive state for sidebar (drawer on mobile)
   const [sidebarOpen,    setSidebarOpen]    = useState(false); // Used for mobile drawer
@@ -280,12 +359,30 @@ export default function ResultsPage() {
       api.getGeoJSON(jobId)
         .then(data => {
           setGeojsonData(data);
-          // If we had a geojson error before, clear it on successful fetch
           setGeojsonError(null);
         })
         .catch(err => setGeojsonError(err.message));
+
+      // Also try to fetch the dynamic geojson if available
+      api.getDynamicGeoJSON(jobId)
+        .then(data => setDynamicGeojsonData(data))
+        .catch(() => {}); // silent fail if not generated yet
     }
   }, [jobId, job?.status]);
+
+  // Load Rainfall Metrics JSON
+  useEffect(() => {
+    if (job?.status === "complete" || job?.status === "partial") {
+      // Try to find the metrics file by matching village name
+      const metricsFile = files.find(f => f.name.endsWith("_RainfallMetrics.json"));
+      if (metricsFile) {
+        fetch(api.getFileUrl(jobId, metricsFile.name))
+          .then(res => res.ok ? res.json() : null)
+          .then(data => setRainfallMetrics(data))
+          .catch(() => setRainfallMetrics(null));
+      }
+    }
+  }, [jobId, job?.status, files]);
 
   const handleFeatureClick = useCallback((props) => {
     setSelectedFeature(props);
@@ -439,6 +536,11 @@ export default function ResultsPage() {
                   </div>
                 </CollapsibleSection>
 
+                {/* ── Rainfall Analysis Metrics ───────────────────────── */}
+                <CollapsibleSection title="Rainfall Analysis" icon="🌧️" badge={rainfallMetrics?.scenario?.toUpperCase()} defaultOpen>
+                  <RainfallMetricsPanel metrics={rainfallMetrics} />
+                </CollapsibleSection>
+
                 {/* ── Hydraulic Attribute Inspector ─────────────────────── */}
                 <CollapsibleSection
                   title="Hydraulic Inspector"
@@ -588,9 +690,10 @@ export default function ResultsPage() {
                     )}
                   </div>
 
-                  <DrainageMapPanel
-                    dtmUrl={dtmUrl}
+                  <DrainageMapPanel 
+                    dtmUrl={dtmUrl} 
                     geojsonData={geojsonData}
+                    dynamicGeojsonData={dynamicGeojsonData}
                     onFeatureClick={handleFeatureClick}
                     selectedFeatureId={selectedFeature?.id}
                   />

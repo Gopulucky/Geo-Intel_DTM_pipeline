@@ -7,6 +7,7 @@ export default function HomePage() {
   const [file, setFile]         = useState(null);
   const [village, setVillage]   = useState("");
   const [epsgCode, setEpsgCode] = useState("");
+  const [rainfallScenario, setRainfallScenario] = useState("flood");
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError]       = useState("");
@@ -31,7 +32,7 @@ export default function HomePage() {
     setError("");
 
     try {
-      const res = await api.upload(file, village, epsgCode);
+      const res = await api.upload(file, village, epsgCode, null, rainfallScenario);
       navigate(`/processing/${res.job_id}`);
     } catch (err) {
       setError(err.message);
@@ -71,7 +72,7 @@ export default function HomePage() {
             Geo-Intel Platform
           </h1>
           <p className="text-slate-300 text-base lg:text-lg max-w-xl mx-auto font-light leading-relaxed px-4">
-            LULC Classification <span className="text-brand-500 mx-2">•</span> Hydrology <span className="text-brand-500 mx-2">•</span> Drainage Design
+            Point Cloud Analytics <span className="text-brand-500 mx-2">•</span> Hydrology <span className="text-brand-500 mx-2">•</span> Drainage Design
           </p>
           <div className="inline-flex mt-6 items-center gap-2 bg-brand-500/10 border border-brand-500/30 text-brand-300 text-[10px] lg:text-xs px-4 py-1.5 rounded-full uppercase tracking-widest font-bold">
             <span className="w-2 h-2 rounded-full bg-brand-400 animate-pulse-slow"></span>
@@ -154,6 +155,26 @@ export default function HomePage() {
                   className="w-full bg-slate-900/80 border border-slate-700 rounded-xl px-4 py-3.5 lg:py-4 text-white placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500 transition-all font-medium text-sm lg:text-base"
                 />
               </div>
+
+              {/* Analysis Scenario */}
+              <div className="md:col-span-2">
+                <label className="block text-[11px] lg:text-xs font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Analysis Scenario</label>
+                <div className="relative">
+                  <select
+                    value={rainfallScenario}
+                    onChange={(e) => setRainfallScenario(e.target.value)}
+                    className="w-full appearance-none bg-slate-900/80 border border-slate-700 rounded-xl px-4 py-3.5 lg:py-4 text-white focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500 transition-all font-medium text-sm lg:text-base cursor-pointer"
+                  >
+                    <option value="flood">Flood Simulation (Extreme Rainfall / P99)</option>
+                    <option value="waterlogging">Waterlogging Simulation (Normal Rainy Day / P50)</option>
+                  </select>
+                  <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-400">
+                    <svg className="h-4 w-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                      <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
+                    </svg>
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Error */}
@@ -213,7 +234,7 @@ export default function HomePage() {
         <div className="mt-10 lg:mt-14 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 w-full">
           {[
             { icon: "🏔️", label: "Terrain Models", desc: "High-res DTM/DSM" },
-            { icon: "🌱", label: "LULC AI", desc: "ML Land Classification" },
+            { icon: "🌍", label: "Analytics", desc: "Point Cloud Processing" },
             { icon: "💧", label: "Drainage", desc: "Hydrological flows" },
             { icon: "🌐", label: "Intelligence", desc: "Interactive mapping" },
           ].map((item, i) => (

@@ -6,8 +6,7 @@ import { api } from "../api/client";
 const STAGES = [
   { id: 1, label: "Point Cloud Analytics", desc: "Generating DTM, DSM, CHM from .las file" },
   { id: 2, label: "Hydrological Modeling", desc: "Computing flow direction, drainage design" },
-  { id: 3, label: "LULC AI Classification",desc: "Random Forest ML land use mapping" },
-  { id: 4, label: "Map Synthesis",         desc: "Creating interactive maps and summary" },
+  { id: 3, label: "Map Synthesis",         desc: "Creating interactive maps and summary" },
 ];
 
 export default function ProcessingPage() {

@@ -9,6 +9,15 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 
+
+import pandas as pd
+import laspy
+from scipy.interpolate import griddata
+from rasterio.transform import from_bounds
+from rasterio.crs import CRS
+import matplotlib.animation as animation
+from matplotlib.colors import LinearSegmentedColormap
+
 def setup_whitebox(working_dir):
     """Initializes WhiteboxTools and sets the working directory."""
     wbt = whitebox.WhiteboxTools()
@@ -372,45 +381,7 @@ def fix_raster_crs(target_tif, ref_tif):
         dst.write(data)
     shutil.move(tmp_tif, target_tif)
 
-def compute_vulnerability_impact(flood_vuln_file, lulc_file, report_file):
-    import rasterio
-    import numpy as np
-    import json
-    import os
-    
-    if not os.path.exists(lulc_file) or not os.path.exists(flood_vuln_file):
-        return
-        
-    print("⏳ Computing Vulnerability Impact Statistics (Data Fusion)...")
-    with rasterio.open(flood_vuln_file) as src:
-        vuln = src.read(1).astype(float)
-        vuln[vuln == src.nodata] = np.nan
-        res_x = abs(src.transform[0])
-        res_y = abs(src.transform[4])
-        pixel_area_m2 = res_x * res_y
-        
-    with rasterio.open(lulc_file) as src:
-        lulc = src.read(1)
-        
-    import warnings
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        threshold = np.nanpercentile(vuln, 70)
-        hotspots = vuln >= threshold
-    
-    impact = {}
-    classes = {1: 'Residential', 2: 'Agricultural', 3: 'Water bodies', 4: 'Roads'}
-    
-    for cls_val, cls_name in classes.items():
-        mask = (lulc == cls_val) & hotspots
-        count = np.count_nonzero(mask)
-        area_ha = (count * pixel_area_m2) / 10000.0
-        impact[cls_name + " (Hectares)"] = round(area_ha, 2)
-        
-    with open(report_file, 'w') as f:
-        json.dump(impact, f, indent=4)
-        
-    print(f"✅ Vulnerability Impact Report saved to: {report_file}")
+
 
 def consolidate_vectors_to_gpkg(work_dir, pfx, dtm_crs=None):
     """Consolidates all shapefiles and single-layer gpkgs into a single final GPKG.
@@ -517,9 +488,56 @@ def rainfall_based_threshold(
 
     return max(10, threshold_cells)
 
+def adjust_waterlogging_depth(water_depth_file: str, current_intensity: float, max_intensity: float):
+    """
+    Dynamically scales the waterlogging depth based on the rainfall intensity.
+    Reduces the extent by subtracting a deficit, and scales the remaining depth.
+    """
+    if not os.path.exists(water_depth_file):
+        return
+        
+    ratio = min(1.0, current_intensity / max_intensity)
+    if ratio >= 0.95:
+        return # Flood scenario, keep full depths
+        
+    print(f"  [Rainfall] Adjusting waterlogging depths (Intensity Ratio: {ratio:.2f})")
+    
+    deficit_m = 0.5 * (1.0 - ratio) # Max 0.5m deficit at edges
+    
+    try:
+        with rasterio.open(water_depth_file) as src:
+            arr = src.read(1).astype(np.float32)
+            meta = src.meta.copy()
+            nodata = src.nodata
+            
+        if nodata is None:
+            nodata = -9999.0
+            
+        mask = (arr != nodata) & (arr > 0)
+        
+        # Subtract deficit
+        arr[mask] = arr[mask] - deficit_m
+        
+        # Floor to 0
+        arr[mask & (arr <= 0)] = 0
+        
+        # Scale remaining
+        arr[mask & (arr > 0)] = arr[mask & (arr > 0)] * ratio
+        
+        # Optional: set 0 to nodata so extent looks smaller in frontend
+        arr[arr == 0] = nodata
+        
+        meta.update(nodata=nodata)
+        with rasterio.open(water_depth_file, 'w', **meta) as dst:
+            dst.write(arr, 1)
+            
+    except Exception as e:
+        print(f"  [Rainfall] Error adjusting waterlogging depths: {e}")
+
 def run_village_pipeline(work_dir: str, dtm_filename: str,
                          stream_threshold: int = None,
-                         fast_path: bool = False):
+                         fast_path: bool = False,
+                         rainfall_scenario: str = "flood"):
     """
     Run the full hydrology pipeline for one village DTM.
 
@@ -546,10 +564,37 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
         )
         print(f"  Physics-based minimum discharge (Manning): {Qmin:.3f} m³/s")
         
+        from GEO_INTEL_pipeline import fetch_peak_rainfall, get_dtm_center_latlon
+        try:
+            lat, lon = get_dtm_center_latlon(dtm_path)
+            # Fetch the absolute max and scenario-specific rainfall from 10 years of history
+            rainfall_daily = fetch_peak_rainfall(lat, lon, scenario=rainfall_scenario)
+            flood_daily    = fetch_peak_rainfall(lat, lon, scenario="flood")
+            
+            # The Rational Method expects mm/hr, but API returns mm/day.
+            # We normalize so the historical MAXIMUM maps to the engineering
+            # design baseline of 80 mm/hr (which produces well-known good results).
+            # The RATIO between scenarios is preserved from real weather data.
+            ENGINEERING_BASELINE = 80.0  # mm/hr — standard Indian drainage design
+            if flood_daily > 0:
+                rainfall_intensity = (rainfall_daily / flood_daily) * ENGINEERING_BASELINE
+            else:
+                rainfall_intensity = ENGINEERING_BASELINE
+            flood_intensity = ENGINEERING_BASELINE  # max always maps to baseline
+            
+            print(f"  [Rainfall] Historical daily: {rainfall_daily:.1f} mm/day  "
+                  f"(Max: {flood_daily:.1f} mm/day)")
+            print(f"  [Rainfall] Normalized engineering intensity: {rainfall_intensity:.1f} mm/hr  "
+                  f"(Ratio: {rainfall_daily/flood_daily:.2f})")
+        except Exception:
+            print("  [Rainfall] Warning: could not fetch dynamic rainfall, defaulting to 80 mm/hr")
+            rainfall_intensity = 80.0
+            flood_intensity = 80.0
+
         # 2. Compute the flow accumulation threshold using Rational Method
         stream_threshold = rainfall_based_threshold(
             dtm_path,
-            rainfall_intensity_mmhr=100,  # 100mm/hr design storm
+            rainfall_intensity_mmhr=rainfall_intensity,
             runoff_coefficient=0.6,       # typical for rural/village areas
             minimum_discharge=Qmin
         )
@@ -573,11 +618,85 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     TARGETS        = f"{pfx}_Targets.tif"
     DRAIN_RASTER   = f"{pfx}_AlternateDrainage.tif"
     DRAIN_VECTOR   = f"{pfx}_AlternateDrainage.shp"
+    DYNAMIC_RASTER_STREAMS = f"{pfx}_DynamicDrainageNetwork.tif"
+    DYNAMIC_VECTOR_STREAMS = f"{pfx}_DynamicStreams.shp"
 
-    print(f"\n{'='*60}")
+    # ── Compute comparison metrics: Baseline (i=80) vs Dynamic Weather ────────
+    baseline_threshold = rainfall_based_threshold(
+        dtm_path,
+        rainfall_intensity_mmhr=80.0,
+        runoff_coefficient=0.6,
+        minimum_discharge=manning_discharge(0.5, 0.3, 0.001, 0.035)
+    )
+    
+    # Collect all metrics for the comparison table
+    try:
+        ratio = rainfall_daily / flood_daily if flood_daily > 0 else 1.0
+        hist_max = flood_daily
+        hist_scenario = rainfall_daily
+    except NameError:
+        ratio = 1.0
+        hist_max = None
+        hist_scenario = None
+    
+    try:
+        eng_intensity = rainfall_intensity
+    except NameError:
+        eng_intensity = 80.0
+
+    print(f"\n{'='*72}")
     print(f"  HYDROLOGY PIPELINE  ->  {pfx}")
-    print(f"  Stream threshold    ->  {stream_threshold} cells")
-    print(f"{'='*60}")
+    print(f"{'='*72}")
+    print(f"  Scenario Selected   :  {rainfall_scenario.upper()}")
+    print(f"{'─'*72}")
+    print(f"  {'Metric':<40} {'Baseline':>12}  {'Dynamic':>12}")
+    print(f"  {'─'*64}")
+    if hist_max is not None:
+        print(f"  {'Historical Max Rainfall (mm/day)':<40} {'—':>12}  {hist_max:>10.1f}  ")
+        print(f"  {'Scenario Rainfall (mm/day)':<40} {'—':>12}  {hist_scenario:>10.1f}  ")
+        print(f"  {'Weather Ratio (scenario/max)':<40} {'1.00':>12}  {ratio:>10.2f}  ")
+    print(f"  {'Engineering Intensity (mm/hr)':<40} {'80.0':>12}  {eng_intensity:>10.1f}  ")
+    print(f"  {'Stream Threshold (cells)':<40} {baseline_threshold:>12}  {stream_threshold:>12}")
+    thresh_diff = stream_threshold - baseline_threshold
+    thresh_pct = ((stream_threshold - baseline_threshold) / baseline_threshold) * 100 if baseline_threshold > 0 else 0
+    if thresh_diff > 0:
+        stream_change = "FEWER streams (higher threshold)"
+    elif thresh_diff < 0:
+        stream_change = "MORE streams (lower threshold)"
+    else:
+        stream_change = "SAME streams"
+    print(f"  {'Threshold Difference':<40} {'':>12}  {thresh_diff:>+10} ({thresh_pct:+.0f}%)")
+    print(f"  {'Stream Density Impact':<40} {'':>12}  {stream_change}")
+    print(f"{'='*72}")
+
+    # Save the rainfall comparison metrics as a JSON report
+    import json
+    rainfall_report = {
+        "village": pfx,
+        "scenario": rainfall_scenario,
+        "baseline": {
+            "intensity_mm_hr": 80.0,
+            "stream_threshold_cells": baseline_threshold,
+            "description": "Fixed engineering baseline (i=80 mm/hr)"
+        },
+        "dynamic": {
+            "historical_max_daily_mm": hist_max,
+            "historical_scenario_daily_mm": hist_scenario,
+            "weather_ratio": round(ratio, 4) if hist_max else None,
+            "normalized_intensity_mm_hr": round(eng_intensity, 1),
+            "stream_threshold_cells": stream_threshold,
+            "description": f"Dynamic weather-based ({rainfall_scenario})"
+        },
+        "comparison": {
+            "threshold_difference_cells": thresh_diff,
+            "threshold_difference_pct": round(thresh_pct, 1),
+            "stream_density_impact": stream_change
+        }
+    }
+    report_path = os.path.join(work_dir, f"{pfx}_RainfallMetrics.json")
+    with open(report_path, "w") as f:
+        json.dump(rainfall_report, f, indent=2)
+    print(f"  📊 Rainfall comparison report saved -> {report_path}")
 
     wbt = setup_whitebox(work_dir)
 
@@ -592,17 +711,57 @@ def run_village_pipeline(work_dir: str, dtm_filename: str,
     else:
         print("⚡ FAST PATH ENABLED: Skipping DTM Breaching and Flow Accumulation (using existing files).")
 
+    # 1. Main Pipeline Streams (Standard Engineering Baseline i=80)
+    print("\n⏳ [Baseline] Extracting standard stream network (i=80)...")
     step3_stream_extraction_and_smoothing(
         wbt, FACC, FDIR, RASTER_STREAMS, VECTOR_STREAMS,
+        threshold=baseline_threshold, dtm_crs=dtm_crs
+    )
+
+    # 2. Dynamic Weather Streams
+    print(f"\n⏳ [Dynamic] Extracting weather-adjusted streams (scenario: {rainfall_scenario})...")
+    step3_stream_extraction_and_smoothing(
+        wbt, FACC, FDIR, DYNAMIC_RASTER_STREAMS, DYNAMIC_VECTOR_STREAMS,
         threshold=stream_threshold, dtm_crs=dtm_crs
     )
+
+    # 3. Generate Hydraulic Parameters & GeoJSONs
+    from GEO_INTEL_pipeline import compute_drainage_parameters
+    
+    print("\n⏳ Computing drainage parameters (Baseline)...")
+    compute_drainage_parameters(
+        streams_path=os.path.join(work_dir, VECTOR_STREAMS),
+        dtm_path=dtm_path,
+        facc_path=os.path.join(work_dir, FACC),
+        village_name=pfx,
+        rainfall_mm_day=100.0, # Standard design storm approx
+        custom_output_dir=work_dir,
+        file_suffix="DrainageDesign"
+    )
+
+    print("\n⏳ Computing drainage parameters (Dynamic Weather)...")
+    compute_drainage_parameters(
+        streams_path=os.path.join(work_dir, DYNAMIC_VECTOR_STREAMS),
+        dtm_path=dtm_path,
+        facc_path=os.path.join(work_dir, FACC),
+        village_name=pfx,
+        rainfall_mm_day=hist_scenario if hist_scenario else 100.0,
+        custom_output_dir=work_dir,
+        file_suffix="DynamicDrainageDesign"
+    )
+
     step4_waterlogging_hotspots(wbt, dtm_filename, BREACHED_DTM, RASTER_STREAMS, TWI, SLOPE, WATER_DEPTH, HAND)
+    
+    # Adjust waterlogging hotspots dynamically based on rainfall scenario
+    try:
+        adjust_waterlogging_depth(os.path.join(work_dir, WATER_DEPTH), rainfall_intensity, flood_intensity)
+    except NameError:
+        pass # If stream_threshold was provided manually, intensities might not be defined
+
     step5_pour_points_and_catchments(wbt, FDIR, RASTER_STREAMS, WATERSHEDS)
     step6_flood_vulnerability_and_drainage(wbt, dtm_filename, TWI, SLOPE, HAND, RASTER_STREAMS, FLOOD_VULN, COST_SURFACE, TARGETS, COST_DIST, BACKLINK, DRAIN_RASTER, DRAIN_VECTOR, FDIR)
 
-    LULC_FILE = os.path.join(work_dir, f"{pfx}_LULC.tif")
-    REPORT_FILE = os.path.join(work_dir, f"{pfx}_VulnerabilityReport.json")
-    compute_vulnerability_impact(os.path.join(work_dir, FLOOD_VULN), LULC_FILE, REPORT_FILE)
+
 
     print("⏳ Fixing projection metadata for GeoTIFFs...")
     for out_tif in [BREACHED_DTM, FDIR, FACC, RASTER_STREAMS, SLOPE, TWI, WATER_DEPTH, WATERSHEDS, HAND, FLOOD_VULN, COST_SURFACE, COST_DIST, BACKLINK, TARGETS, DRAIN_RASTER]:
@@ -654,9 +813,9 @@ if __name__ == "__main__":
 # WRAPPER FOR BACKEND
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_hydrology_pipeline(village_name: str, output_dir: str, stream_threshold: int = None, fast_path: bool = False):
+def run_hydrology_pipeline(las_path: str, village_name: str, output_dir: str, stream_threshold: int = None, fast_path: bool = False, rainfall_scenario: str = "flood"):
     """Full Hydrology pipeline wrapper for the web backend."""
-    print(f"🚀 Starting Hydrology Pipeline for {village_name}...")
+    print(f"🚀 Starting Hydrology Pipeline for {village_name} (Scenario: {rainfall_scenario})...")
     
     # The existing script expects DTM in a subdirectory of outputs
     # but the backend saves everything in output_dir
@@ -666,6 +825,194 @@ def run_hydrology_pipeline(village_name: str, output_dir: str, stream_threshold:
         work_dir = output_dir,
         dtm_filename = dtm_filename,
         stream_threshold = stream_threshold,
-        fast_path = fast_path
+        fast_path = fast_path,
+        rainfall_scenario = rainfall_scenario
     )
+    
+    print("⏳ Running Building Fluid Simulations...")
+    generate_building_fluid_simulations(las_path, village_name, output_dir)
+    
     print(f"✅ Hydrology Pipeline finished for {village_name}")
+
+# --- MERGED FROM hydrology_with_buildings.py ---
+
+def create_dsm_geotiff(las_path, out_tif, resolution=2.0):
+    print(f"Loading LAS: {las_path}")
+    las = laspy.read(las_path)
+    x, y = ensure_metric_crs(np.array(las.x), np.array(las.y), las.header)
+    z = np.array(las.z)
+    
+    # Subsample if large
+    if len(x) > 3000000:
+        idx = np.random.choice(len(x), 3000000, replace=False)
+        x, y, z = x[idx], y[idx], z[idx]
+        
+    df = pd.DataFrame({"x": x, "y": y, "z": z})
+    
+    x_min, x_max = df["x"].min(), df["x"].max()
+    y_min, y_max = df["y"].min(), df["y"].max()
+    
+    grid_x = np.arange(x_min, x_max + resolution, resolution)
+    grid_y = np.arange(y_min, y_max + resolution, resolution)
+    gx, gy = np.meshgrid(grid_x, grid_y)
+    
+    xi = ((df["x"] - x_min) / resolution).astype(int)
+    yi = ((df["y"] - y_min) / resolution).astype(int)
+    df["cell"] = yi * (len(grid_x) + 1) + xi
+    
+    # 95th percentile captures buildings
+    cell_stats = df.groupby("cell")["z"].quantile(0.95)
+    
+    dsm_sparse_x = []
+    dsm_sparse_y = []
+    dsm_sparse_z = []
+    for cell_id, z_val in cell_stats.items():
+        cx = cell_id % (len(grid_x) + 1)
+        cy = cell_id // (len(grid_x) + 1)
+        if 0 <= cy < len(grid_y) and 0 <= cx < len(grid_x):
+            dsm_sparse_x.append(grid_x[cx])
+            dsm_sparse_y.append(grid_y[cy])
+            dsm_sparse_z.append(z_val)
+            
+    print("Interpolating DSM...")
+    dsm = griddata((dsm_sparse_x, dsm_sparse_y), dsm_sparse_z, (gx, gy), method="linear")
+    
+    mask_nan = np.isnan(dsm)
+    if mask_nan.any():
+        dsm_near = griddata((dsm_sparse_x, dsm_sparse_y), dsm_sparse_z, (gx, gy), method="nearest")
+        dsm[mask_nan] = dsm_near[mask_nan]
+        
+    dsm = np.flipud(dsm)
+    transform = from_bounds(x_min, y_min, x_max, y_max, dsm.shape[1], dsm.shape[0])
+    
+    epsg = 32643
+    if hasattr(las.header, 'parse_crs'):
+        try:
+            crs = las.header.parse_crs()
+            if crs and crs.to_epsg():
+                epsg = crs.to_epsg()
+        except: pass
+
+    with rasterio.open(
+        out_tif, "w", driver="GTiff", height=dsm.shape[0], width=dsm.shape[1],
+        count=1, dtype="float32", crs=CRS.from_epsg(epsg), transform=transform, nodata=-9999.0
+    ) as dst:
+        dst.write(dsm.astype(np.float32), 1)
+        
+    return dsm, transform
+
+def run_dsm_hydrology(dsm_tif, out_dir):
+    wbt = whitebox.WhiteboxTools()
+    wbt.set_working_dir(out_dir)
+    wbt.set_verbose_mode(False)
+    
+    dsm_base = os.path.basename(dsm_tif)
+    breached = "DSM_Breached.tif"
+    fdir = "DSM_FlowDir.tif"
+    facc = "DSM_FlowAcc.tif"
+    sink = "DSM_SinkDepth.tif"
+    streams = "DSM_Streams.tif"
+    
+    print("Running WhiteboxTools on DSM (with buildings)...")
+    wbt.breach_depressions(dem=dsm_base, output=breached)
+    wbt.d8_pointer(dem=breached, output=fdir)
+    wbt.d8_flow_accumulation(i=breached, output=facc, out_type="cells")
+    wbt.depth_in_sink(dem=dsm_base, output=sink, zero_background=True)
+    wbt.extract_streams(flow_accum=facc, output=streams, threshold=500)
+    
+    return {
+        "dsm": dsm_tif,
+        "facc": os.path.join(out_dir, facc),
+        "sink": os.path.join(out_dir, sink)
+    }
+
+def animate_hydrology(hydro_paths, out_gif_hotspots, out_gif_streams):
+    print("Generating Animations...")
+    with rasterio.open(hydro_paths["dsm"]) as src:
+        dsm = src.read(1)
+        dsm[dsm == src.nodata] = np.nan
+        
+    with rasterio.open(hydro_paths["facc"]) as src:
+        facc = src.read(1)
+        facc[facc == src.nodata] = 0
+        
+    with rasterio.open(hydro_paths["sink"]) as src:
+        sink = src.read(1)
+        sink[sink == src.nodata] = 0
+        
+    # Create Hillshade
+    ls = matplotlib.colors.LightSource(azdeg=315, altdeg=45)
+    hillshade = ls.hillshade(dsm, vert_exag=2)
+    
+    # Colormaps
+    colors_water = [(0, 0, 1, 0), (0, 0, 1, 0.5), (0, 0, 0.8, 0.9)]
+    cmap_water = LinearSegmentedColormap.from_list('water', colors_water)
+    
+    colors_stream = [(0, 1, 1, 0), (0, 1, 1, 0.8), (0, 0.5, 1, 1)]
+    cmap_stream = LinearSegmentedColormap.from_list('stream', colors_stream)
+    
+    # Precompute frames
+    num_frames = 60
+    max_sink = np.percentile(sink[sink>0], 95) if (sink>0).any() else 1.0
+    max_facc = np.percentile(facc[facc>0], 95) if (facc>0).any() else 1000
+    
+    facc_log = np.log1p(facc)
+    max_facc_log = np.log1p(max_facc)
+    
+    # ─── ANIMATION 1: HOTSPOTS ───
+    print("Creating Hotspots Animation...")
+    fig1, ax1 = plt.subplots(figsize=(10, 10))
+    ax1.axis("off")
+    ax1.imshow(hillshade, cmap="gray")
+    im_sink = ax1.imshow(np.zeros_like(sink), cmap=cmap_water, vmin=0, vmax=2.0, animated=True)
+    
+    def update_hotspots(frame):
+        progress = frame / num_frames
+        current_sink_threshold = max_sink * progress
+        sink_frame = np.where(sink > 0, np.minimum(sink, current_sink_threshold), 0)
+        im_sink.set_array(sink_frame)
+        return [im_sink]
+        
+    ani1 = animation.FuncAnimation(fig1, update_hotspots, frames=num_frames, interval=100, blit=True)
+    ani1.save(out_gif_hotspots, writer="pillow", fps=15)
+    print(f"Saved Hotspots animation to {out_gif_hotspots}")
+    plt.close(fig1)
+
+    # ─── ANIMATION 2: STREAMS ───
+    print("Creating Streams Animation...")
+    fig2, ax2 = plt.subplots(figsize=(10, 10))
+    ax2.axis("off")
+    ax2.imshow(hillshade, cmap="gray")
+    im_stream = ax2.imshow(np.zeros_like(facc), cmap=cmap_stream, vmin=0, vmax=1, animated=True)
+    
+    def update_streams(frame):
+        progress = frame / num_frames
+        stream_frame = np.where(facc_log > (max_facc_log * (1.0 - progress)), facc_log / max_facc_log, 0)
+        im_stream.set_array(stream_frame)
+        return [im_stream]
+        
+    ani2 = animation.FuncAnimation(fig2, update_streams, frames=num_frames, interval=100, blit=True)
+    ani2.save(out_gif_streams, writer="pillow", fps=15)
+    print(f"Saved Streams animation to {out_gif_streams}")
+    plt.close(fig2)
+
+def generate_building_fluid_simulations(input_las, village_name, output_dir):
+    dsm_tif = os.path.join(output_dir, f"{village_name}_DSM.tif")
+    out_gif_hotspots = os.path.join(output_dir, f"{village_name}_Hydrology_Animation_Hotspots.gif")
+    out_gif_streams = os.path.join(output_dir, f"{village_name}_Hydrology_Animation_Streams.gif")
+    
+    if not os.path.exists(dsm_tif):
+        create_dsm_geotiff(input_las, dsm_tif)
+        run_dsm_hydrology(dsm_tif, output_dir)
+        
+    hydro_paths = {
+        "dsm": dsm_tif,
+        "facc": os.path.join(output_dir, "DSM_FlowAcc.tif"),
+        "sink": os.path.join(output_dir, "DSM_SinkDepth.tif")
+    }
+    animate_hydrology(hydro_paths, out_gif_hotspots, out_gif_streams)
+    
+    return {
+        "hotspots_gif": f"{village_name}_Hydrology_Animation_Hotspots.gif",
+        "streams_gif": f"{village_name}_Hydrology_Animation_Streams.gif"
+    }

@@ -2,7 +2,7 @@
 const BASE_URL = import.meta.env.VITE_API_URL;
 
 export const api = {
-    upload: async (file, villageName, epsgCode, streamThreshold) => {
+    upload: async (file, villageName, epsgCode, streamThreshold, rainfallScenario = "flood") => {
         const formData = new FormData();
         formData.append("file", file);
         formData.append("village_name", villageName);
@@ -12,6 +12,7 @@ export const api = {
         if (streamThreshold !== undefined && streamThreshold !== null) {
             formData.append("stream_threshold", streamThreshold);
         }
+        formData.append("rainfall_scenario", rainfallScenario);
         const res = await fetch(`${BASE_URL}/upload`, { method: "POST", body: formData });
         if (!res.ok) {
             const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -29,9 +30,12 @@ export const api = {
         return res.json();
     },
 
-    rerunHydrology: async (jobId, streamThreshold) => {
+    rerunHydrology: async (jobId, streamThreshold, rainfallScenario = "flood") => {
         const formData = new FormData();
-        formData.append("stream_threshold", streamThreshold);
+        if (streamThreshold !== undefined && streamThreshold !== null) {
+            formData.append("stream_threshold", streamThreshold);
+        }
+        formData.append("rainfall_scenario", rainfallScenario);
         const res = await fetch(`${BASE_URL}/rerun-hydrology/${jobId}`, { method: "POST", body: formData });
         if (!res.ok) {
             const err = await res.json().catch(() => ({ detail: res.statusText }));
@@ -55,6 +59,12 @@ export const api = {
     getGeoJSON: async (jobId) => {
         const res = await fetch(`${BASE_URL}/geojson/${jobId}`);
         if (!res.ok) throw new Error("DrainageDesign GeoJSON not available yet");
+        return res.json();
+    },
+
+    getDynamicGeoJSON: async (jobId) => {
+        const res = await fetch(`${BASE_URL}/geojson/dynamic/${jobId}`);
+        if (!res.ok) throw new Error("Dynamic DrainageDesign GeoJSON not available yet");
         return res.json();
     },
 

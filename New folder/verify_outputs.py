@@ -6,10 +6,12 @@ import rasterio
 import matplotlib.pyplot as plt
 import seaborn as sns
 import argparse
+from memory_profiler import profile
 
 # ==========================================
 # 1. DTM ASPRS ACCURACY VERIFICATION
 # ==========================================
+@profile
 def verify_dtm(dtm_path, gcp_path, output_dir, village_name):
     if not os.path.exists(gcp_path):
         print("WARNING: No Ground Truth GCP CSV found. Skipping DTM numerical verification.")
@@ -74,6 +76,7 @@ def verify_dtm(dtm_path, gcp_path, output_dir, village_name):
 # ==========================================
 # 2. DRAINAGE ENGINEERING BOUNDS VERIFICATION
 # ==========================================
+@profile
 def verify_drainage(drainage_path, output_dir, village_name):
     print(f"\n--- Verifying Drainage Parameters ---")
     if not os.path.exists(drainage_path):
@@ -145,10 +148,11 @@ def verify_drainage(drainage_path, output_dir, village_name):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Verify DTM and Drainage Outputs.")
     parser.add_argument("--village", type=str, default="67169_5NKR_CHAKHIRASINGH", help="Name of the village to verify")
+    parser.add_argument("--output_dir", type=str, default=None, help="Specific output directory (e.g., outputs/jobs/5b57e6fd)")
     args = parser.parse_args()
 
     VILLAGE_NAME = args.village
-    OUTPUT_DIR = f"./outputs/{VILLAGE_NAME}"
+    OUTPUT_DIR = args.output_dir if args.output_dir else f"./outputs/{VILLAGE_NAME}"
     DTM_PATH = os.path.join(OUTPUT_DIR, f"{VILLAGE_NAME}_DTM.tif")
     DRAINAGE_PATH = os.path.join(OUTPUT_DIR, f"{VILLAGE_NAME}_DrainageDesign.gpkg")
     GCP_CSV_PATH = os.path.join(OUTPUT_DIR, f"{VILLAGE_NAME}_ground_truth.csv")

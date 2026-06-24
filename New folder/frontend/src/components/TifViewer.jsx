@@ -132,7 +132,7 @@ function Legend({ type }) {
 
 // ── Main TifViewer Component ─────────────────────────────────────────────────
 
-export default function TifViewer({ tifUrl, type = "lulc", title = "Map" }) {
+export default function TifViewer({ tifUrl, type = "dtm", title = "Map" }) {
   const mapRef        = useRef(null);
   const mapInstance   = useRef(null);
   const geoLayer      = useRef(null);

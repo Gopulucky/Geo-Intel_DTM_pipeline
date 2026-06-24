@@ -120,7 +120,8 @@ async def upload_file(
     file: UploadFile = File(...),
     village_name: str = Form(...),
     epsg_code: str = Form(None),
-    stream_threshold: int = Form(None)
+    stream_threshold: int = Form(None),
+    rainfall_scenario: str = Form("flood")
 ):
     """
     Receives .las/.laz file and village name.
@@ -177,7 +178,8 @@ async def upload_file(
         village_name=village_name,
         output_dir=output_dir,
         epsg_code=epsg_code,
-        stream_threshold=stream_threshold
+        stream_threshold=stream_threshold,
+        rainfall_scenario=rainfall_scenario
     )
 
     return {
@@ -237,7 +239,8 @@ async def run_demo(background_tasks: BackgroundTasks, village_name: str = "DEMO_
 async def rerun_hydrology(
     job_id: str,
     background_tasks: BackgroundTasks,
-    stream_threshold: int = Form(...)
+    stream_threshold: int = Form(None),
+    rainfall_scenario: str = Form("flood")
 ):
     """
     Re-runs the Hydrology and Map stages with a new physics threshold.
@@ -250,7 +253,8 @@ async def rerun_hydrology(
     background_tasks.add_task(
         re_run_hydrology_stages,
         job_id=job_id,
-        stream_threshold=stream_threshold
+        stream_threshold=stream_threshold,
+        rainfall_scenario=rainfall_scenario
     )
     
     return {"status": "re_running_hydrology", "job_id": job_id}
@@ -311,6 +315,29 @@ def get_drainage_geojson(job_id: str):
     matches = _glob.glob(os.path.join(output_dir, "*_DrainageDesign.geojson"))
     if not matches:
         raise HTTPException(status_code=404, detail="DrainageDesign GeoJSON not yet generated.")
+
+    geojson_path = matches[0]
+    return FileResponse(
+        path=geojson_path,
+        media_type="application/geo+json",
+        headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"}
+    )
+
+@app.get("/geojson/dynamic/{job_id}")
+def get_dynamic_drainage_geojson(job_id: str):
+    """Returns the DynamicDrainageDesign GeoJSON (WGS-84) for the Leaflet map panel."""
+    if job_id not in job_store:
+        raise HTTPException(status_code=404, detail="Job not found.")
+
+    output_dir = settings.get_output_dir(job_id)
+    if not os.path.exists(output_dir):
+        raise HTTPException(status_code=404, detail="No outputs found.")
+
+    # Find the DynamicDrainageDesign GeoJSON regardless of village name prefix
+    import glob as _glob
+    matches = _glob.glob(os.path.join(output_dir, "*_DynamicDrainageDesign.geojson"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="DynamicDrainageDesign GeoJSON not yet generated.")
 
     geojson_path = matches[0]
     return FileResponse(

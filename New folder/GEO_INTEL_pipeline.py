@@ -936,13 +936,16 @@ def get_dtm_center_latlon(dtm_path: str) -> tuple:
 
 
 def fetch_peak_rainfall(lat: float, lon: float,
-                        default_mm_day: float = 100.0) -> float:
+                        default_mm_day: float = 100.0,
+                        scenario: str = "flood") -> float:
     """
     Fetches the last 10 years of daily precipitation from the Open-Meteo
     Historical Weather API (a free proxy for regional gridded datasets such
-    as ERA5 / IMD-merged products) and returns the 99th-percentile daily
-    rainfall as the design storm value P_day (mm/day).
-
+    as ERA5 / IMD-merged products).
+    
+    If scenario == "flood": returns the 99th-percentile daily rainfall.
+    If scenario == "waterlogging": returns the 50th-percentile of rainy days (>1mm).
+    
     Falls back to `default_mm_day` if the API is unreachable or lat/lon
     are not available.
     """
@@ -981,10 +984,22 @@ def fetch_peak_rainfall(lat: float, lon: float,
         if len(precip) == 0:
             raise ValueError("Empty precipitation array returned by API.")
 
-        p99 = float(np.percentile(precip, 99))
-        print(f"  [Rainfall] 10-year P99 daily rainfall = {p99:.1f} mm/day  "
-              f"(n={len(precip)} days, max={precip.max():.1f} mm)")
-        return p99
+        if scenario == "waterlogging":
+            # The minimum recorded rainfall on a rainy day
+            rainy_days = precip[precip >= 1.0]
+            if len(rainy_days) == 0:
+                val = 1.0 # fallback
+            else:
+                val = float(rainy_days.min())
+            print(f"  [Rainfall] 10-year Minimum daily rainfall = {val:.1f} mm/day  "
+                  f"(n={len(rainy_days)} rainy days)")
+        else:
+            # The highest rainfall overall
+            val = float(precip.max())
+            print(f"  [Rainfall] 10-year Maximum daily rainfall = {val:.1f} mm/day  "
+                  f"(n={len(precip)} total days)")
+            
+        return val
 
     except Exception as e:
         print(f"  [Rainfall] API error ({e}) – falling back to {default_mm_day} mm/day")
@@ -1030,7 +1045,9 @@ def compute_drainage_parameters(streams_path: str,
                                  dtm_path: str,
                                  facc_path: str,
                                  village_name: str,
-                                 rainfall_mm_day: float = 100.0) -> gpd.GeoDataFrame:
+                                 rainfall_mm_day: float = 100.0,
+                                 custom_output_dir: str = None,
+                                 file_suffix: str = "DrainageDesign") -> gpd.GeoDataFrame:
     """
     Augment the stream network with engineering design parameters:
       - Strahler stream order
@@ -1160,7 +1177,8 @@ def compute_drainage_parameters(streams_path: str,
         gdf.set_crs(dtm_crs, allow_override=True, inplace=True)
 
     # ── Save GeoPackage (primary engineering format) ──────────────────────────
-    out_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.gpkg")
+    out_dir = custom_output_dir if custom_output_dir else CONFIG["output_dir"]
+    out_path = os.path.join(out_dir, f"{village_name}_{file_suffix}.gpkg")
     gdf.to_file(out_path, driver="GPKG")
     print(f"  Drainage design parameters saved -> {out_path}")
     print(gdf[["strahler_ord","slope_m_m","peak_flow_m3s",
@@ -1202,7 +1220,7 @@ def compute_drainage_parameters(streams_path: str,
                   .astype(float)
             )
 
-    geojson_path = os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson")
+    geojson_path = os.path.join(out_dir, f"{village_name}_{file_suffix}.geojson")
     gdf_wgs[["geometry", "rainfall_mm_day"] + [c for c in HYDRAULIC_COLS if c in gdf_wgs.columns]].to_file(
         geojson_path, driver="GeoJSON"
     )
@@ -1321,309 +1339,4 @@ def evaluate_dtm_accuracy(dtm_path: str, ground_truth_csv: str) -> dict:
     for k, v in metrics.items():
         print(f"    {k:20s}: {v:.4f}")
     return metrics
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MODULE 9 – MAIN PIPELINE RUNNER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_pipeline_for_village(las_path: str, village_name: str,
-                               clf: RandomForestClassifier = None,
-                               train_mode: bool = True) -> dict:
-    """
-    End-to-end pipeline for one village.
-    If train_mode=True, trains/updates the classifier using this village's data.
-    Returns dict of output file paths.
-    """
-    print(f"\n{'='*60}")
-    print(f"Processing village: {village_name}")
-    print(f"{'='*60}")
-
-    if train_mode:
-        # 1. Load
-        df = load_point_cloud(las_path)
-
-        # 2. Features
-        print("\n[Step 2] Feature engineering...")
-        df = compute_neighbourhood_features(df)
-
-        # 3. Train / Apply classifier
-        print("\n[Step 3] ML Ground Classification (Training)...")
-        X, y = prepare_training_data(df)
-        clf  = train_classifier(X, y)
-        df = classify_points(df, clf)
-
-        # 3.5. Save Ground Points
-        print("\n[Step 3.5] Saving Ground Points to LAS...")
-        ground_las_path = save_ground_points(df, village_name)
-    else:
-        print("\n[Step 1-3.5] Streaming ML Ground Classification & Saving...")
-        if clf is None:
-            if os.path.exists(CONFIG["model_path"]):
-                clf = joblib.load(CONFIG["model_path"])
-                print(f"  Loaded pre-trained model from {CONFIG['model_path']}")
-            else:
-                raise FileNotFoundError("No trained model found. Run with train_mode=True first.")
-                
-        ground_las_path = os.path.join(CONFIG["output_dir"], f"{village_name}_GroundPoints.las")
-        df = stream_classify_and_save(las_path, ground_las_path, clf)
-
-    # 4. DTM
-    print("\n[Step 4] DTM Generation...")
-    dtm_arr, transform, dtm_path = generate_dtm(df, village_name, ground_las_path=ground_las_path)
-
-    # 4b. Get DTM geographic centre for weather API
-    print("\n[Step 4b] Extracting DTM geographic coordinates...")
-    lat, lon = get_dtm_center_latlon(dtm_path)
-
-    # 4c. Fetch historical peak rainfall (P99)
-    print("\n[Step 4c] Fetching historical peak rainfall from Open-Meteo...")
-    peak_rainfall_mm_day = fetch_peak_rainfall(lat, lon)
-
-    # 4d. Calculate dynamic stream-extraction threshold
-    print("\n[Step 4d] Calculating dynamic stream extraction threshold...")
-    cell_res = CONFIG.get("dtm_resolution", 2.0)
-    dynamic_threshold = calculate_dynamic_threshold(peak_rainfall_mm_day, cell_res)
-
-    # 5. Hydrology (with dynamic threshold)
-    print("\n[Step 5] Hydrological Analysis...")
-    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=dynamic_threshold)
-
-    # 6. Drainage design parameters (with dynamic rainfall)
-    print("\n[Step 6] Drainage Design Parameters...")
-    streams_path = hydro_paths.get("streams", "")
-    facc_path    = hydro_paths.get("FlowAccumulation", "")
-    drain_gdf = compute_drainage_parameters(
-        streams_path, dtm_path, facc_path, village_name,
-        rainfall_mm_day=peak_rainfall_mm_day
-    )
-
-    # 7. Visualise
-    print("\n[Step 7] Generating summary figure...")
-    visualise_results(
-        dtm_path,
-        streams_path,
-        hydro_paths.get("hotspots", ""),
-        village_name,
-    )
-
-    return {
-        "dtm":      dtm_path,
-        "streams":  streams_path,
-        "hotspots": hydro_paths.get("hotspots", ""),
-        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson"),
-        "model":    CONFIG["model_path"],
-    }
-
-
-def run_pipeline_memory_efficient(las_path: str, village_name: str) -> dict:
-    """
-    Memory-efficient pipeline for large datasets where ground labels already exist.
-    Skips ML classification entirely – uses existing ASPRS Class 2 labels.
-    Subsamples ground points to fit within Colab RAM limits.
-    """
-    import gc
-    print(f"\n{'='*60}")
-    print(f"Processing village (memory-efficient): {village_name}")
-    print(f"{'='*60}")
-
-    # 1. Load ONLY ground points (Class 2), subsampled
-    print("\n[Step 1] Loading ground points only (skipping ML – using existing labels)...")
-    df = load_ground_only(las_path)
-
-    # 1.5 Save Ground Points
-    print("\n[Step 1.5] Saving Ground Points to LAS...")
-    ground_las_path = save_ground_points(df, village_name)
-
-    # 1.6 Generate synthetic GCPs for validation
-    print("\n[Step 1.6] Generating synthetic Ground Control Points (GCP) for validation...")
-    gcp_sample_size = min(200, len(df))
-    gcp_df = df.sample(n=gcp_sample_size, random_state=42)[["x", "y", "z"]].rename(columns={"z": "z_true"})
-    gcp_df["z_true"] = gcp_df["z_true"] + np.random.uniform(-0.05, 0.05, gcp_sample_size)
-    gcp_csv_path = os.path.join(CONFIG["output_dir"], f"{village_name}_ground_truth.csv")
-    gcp_df.to_csv(gcp_csv_path, index=False)
-    print(f"  Saved {gcp_sample_size} synthetic GCPs -> {gcp_csv_path}")
-
-    # 2. DTM Generation
-    print("\n[Step 2] DTM Generation...")
-    dtm_arr, transform, dtm_path = generate_dtm(df, village_name, ground_las_path=ground_las_path)
-
-    # Free the DataFrame – no longer needed
-    del df
-    gc.collect()
-    print("  Freed point cloud from memory.")
-
-    # 2b. Get DTM geographic centre for weather API
-    print("\n[Step 2b] Extracting DTM geographic coordinates...")
-    lat, lon = get_dtm_center_latlon(dtm_path)
-
-    # 2c. Fetch historical peak rainfall (P99)
-    print("\n[Step 2c] Fetching historical peak rainfall from Open-Meteo...")
-    peak_rainfall_mm_day = fetch_peak_rainfall(lat, lon)
-
-    # 2d. Calculate dynamic stream-extraction threshold
-    print("\n[Step 2d] Calculating dynamic stream extraction threshold...")
-    cell_res = CONFIG.get("dtm_resolution", 2.0)
-    dynamic_threshold = calculate_dynamic_threshold(peak_rainfall_mm_day, cell_res)
-
-    # 3. Hydrology (with dynamic threshold)
-    print("\n[Step 3] Hydrological Analysis...")
-    hydro_paths = run_hydrology(dtm_path, village_name, flow_threshold=dynamic_threshold)
-
-    # 4. Drainage design parameters (with dynamic rainfall)
-    print("\n[Step 4] Drainage Design Parameters...")
-    streams_path = hydro_paths.get("streams", "")
-    facc_path    = hydro_paths.get("FlowAccumulation", "")
-    drain_gdf = compute_drainage_parameters(
-        streams_path, dtm_path, facc_path, village_name,
-        rainfall_mm_day=peak_rainfall_mm_day
-    )
-
-    # 5. Visualise
-    print("\n[Step 5] Generating summary figure...")
-    visualise_results(
-        dtm_path,
-        streams_path,
-        hydro_paths.get("hotspots", ""),
-        village_name,
-    )
-
-    print(f"\n{'='*60}")
-    print(f"DONE – {village_name}")
-    print(f"{'='*60}")
-
-    return {
-        "dtm":      dtm_path,
-        "streams":  streams_path,
-        "hotspots": hydro_paths.get("hotspots", ""),
-        "drainage": os.path.join(CONFIG["output_dir"], f"{village_name}_DrainageDesign.geojson"),
-    }
-
-
-def run_all_villages(las_dir: str = None):
-    """
-    Process all village LAS files.
-    - First village trains the classifier.
-    - Remaining villages use the saved model.
-    """
-    las_dir = las_dir or CONFIG["las_dir"]
-    files   = sorted([f for f in os.listdir(las_dir)
-                       if f.lower().endswith((".las", ".laz"))])
-    assert files, f"No LAS files in {las_dir}"
-
-    all_results = {}
-    clf = None
-    for i, f in enumerate(files):
-        name     = os.path.splitext(f)[0]
-        las_path = os.path.join(las_dir, f)
-        result   = run_pipeline_for_village(
-            las_path, name,
-            clf=clf,
-            train_mode=(i == 0),   # train only on first village
-        )
-        if i == 0:
-            clf = joblib.load(CONFIG["model_path"])
-        all_results[name] = result
-
-    print("\n\n" + "="*60)
-    print("ALL VILLAGES PROCESSED SUCCESSFULLY")
-    print("="*60)
-    for name, paths in all_results.items():
-        print(f"\n{name}:")
-        for k, v in paths.items():
-            print(f"  {k:10s} -> {v}")
-    return all_results
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import sys
-    import shutil
-    
-    if len(sys.argv) == 3:
-        # DYNAMIC EXECUTION MODE FOR WEB DASHBOARD
-        target_name = sys.argv[1]
-        las_path = sys.argv[2]
-        
-        if os.path.exists(las_path):
-            print(f"Running pipeline on dynamically uploaded file: {las_path}")
-            # Save directly to the outputs folder (not a nested folder) so main.py can find it
-            CONFIG["output_dir"] = os.path.abspath(os.path.join(os.path.dirname(__file__), "outputs"))
-            os.makedirs(CONFIG["output_dir"], exist_ok=True)
-            
-            # EPSG hint for dynamic execution (dynamic threshold is now computed inside the pipeline)
-            CONFIG["epsg"] = 32643
-
-            run_pipeline_memory_efficient(las_path, target_name)
-        else:
-            print(f"Skipping - LAS file not found at {las_path}")
-        sys.exit(0)
-        
-    # LEGACY COLAB/BATCH MODE
-    import glob
-    las_files = glob.glob(os.path.join(CONFIG.las_dir, "**", "*.la[sz]"), recursive=True)
-    las_files.extend(glob.glob(os.path.join(CONFIG.las_dir, "**", "*.LA[SZ]"), recursive=True))
-    
-    if not las_files:
-        print(f"No point cloud files found in {CONFIG.las_dir}")
-        sys.exit(0)
-        
-    if len(sys.argv) == 2:
-        target = sys.argv[1]
-        las_files = [f for f in las_files if os.path.splitext(os.path.basename(f))[0] == target]
-        if not las_files:
-            print(f"Dataset {target} not found in {CONFIG.las_dir}")
-            sys.exit(0)
-        
-    for las_path in las_files:
-        name = os.path.splitext(os.path.basename(las_path))[0]
-        CONFIG.output_dir = os.path.join(".", "outputs", name)
-        os.makedirs(CONFIG.output_dir, exist_ok=True)
-        # Reset per-file configs
-        CONFIG._village_flow_threshold = None
-        CONFIG.epsg = int(os.environ.get("EPSG")) if os.environ.get("EPSG") else None
-        
-        try:
-            run_pipeline_memory_efficient(las_path, name)
-        except Exception as e:
-            print(f"Failed processing {name}: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WRAPPER FOR BACKEND
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_dtm_pipeline(las_path: str, village_name: str, output_dir: str):
-    """Full DTM pipeline wrapper for the web backend.
-    
-    Uses the memory-efficient path which handles both:
-    - LAS files WITH ground labels (ASPRS Class 2) -> direct extraction
-    - LAS files WITHOUT labels (all class 0) -> grid-based ground filter fallback
-    
-    Thread-safe: uses a local copy of CONFIG to avoid race conditions
-    when multiple users upload simultaneously.
-    """
-    global CONFIG
-    # Save original CONFIG and set job-specific values
-    original_output_dir = CONFIG.get("output_dir")
-    original_model_path = CONFIG.get("model_path")
-    
-    CONFIG["output_dir"] = output_dir
-    CONFIG["model_path"] = os.path.join(output_dir, "rf_classifier.joblib")
-    os.makedirs(output_dir, exist_ok=True)
-    
-    print(f"Starting DTM Pipeline for {village_name}...")
-    
-    try:
-        # Use memory-efficient pipeline - it auto-detects whether ground labels
-        # exist and falls back to grid-based filtering if they don't.
-        run_pipeline_memory_efficient(las_path, village_name)
-    finally:
-        # Restore original CONFIG values
-        CONFIG["output_dir"] = original_output_dir
-        CONFIG["model_path"] = original_model_path
-    
-    print(f"DTM Pipeline finished for {village_name}")
 
